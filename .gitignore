@@ -1,0 +1,6 @@
+node_modules
+.env
+/public/uploads/accommodations/
+/public/uploads/room_types/
+package-lock.json
+tests
