@@ -32,6 +32,20 @@ const accommodationAdminRoutes = require("./accommodation_admin_routes");
 router.use("/accommodations", requireAdminLogin, accommodationAdminRoutes);
 
 /**
+ * ADMIN BOOKINGS
+ * /api/admin/bookings/*
+ */
+const bookingAdminRoutes = require("./booking_admin_routes");
+router.use("/bookings", requireAdminLogin, bookingAdminRoutes);
+
+/**
+ * ADMIN DASHBOARD
+ * /api/admin/dashboard/*
+ */
+const dashboardAdminRoutes = require("./dashboard_admin_routes");
+router.use("/dashboard", requireAdminLogin, dashboardAdminRoutes);
+
+/**
  * LOOKUP (Tỉnh/Thành phố, Loại hình, Tiện ích, ...)
  * /api/admin/lookup/*
  */

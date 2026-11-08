@@ -3,4 +3,6 @@ node_modules
 /public/uploads/accommodations/
 /public/uploads/room_types/
 package-lock.json
-tests
+test
+scripts
+migrations
