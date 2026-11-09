@@ -89,9 +89,9 @@ function parseStayStatus(query) {
 
   const value = String(query.stayStatus).trim().toLowerCase();
 
-  if (!["checkin", "checkout"].includes(value)) {
+  if (!["checkin", "checkout", "checkedin", "checkedout"].includes(value)) {
     throw validationError("stayStatus không hợp lệ.", {
-      stayStatus: "Chỉ chấp nhận: checkin, checkout",
+      stayStatus: "Chỉ chấp nhận: checkin, checkout, checkedin, checkedout",
     });
   }
 
@@ -131,6 +131,7 @@ function mapBookingSummary(row) {
     customerEmail: row.contact_email,
     accommodationId: row.accommodation_id,
     accommodationName: row.accommodation_name,
+    managerName: row.manager_full_name ?? null,
     roomTypeNames: row.room_type_names
       ? String(row.room_type_names).split(", ")
       : [],
@@ -199,6 +200,10 @@ function buildListFilters(query, currentUser = {}) {
     whereParts.push(
       "b.status = 'CONFIRMED' AND b.checked_in_at IS NOT NULL AND b.checked_out_at IS NULL",
     );
+  } else if (stayStatus === "checkedin") {
+    whereParts.push("b.checked_in_at IS NOT NULL");
+  } else if (stayStatus === "checkedout") {
+    whereParts.push("b.checked_out_at IS NOT NULL");
   }
 
   return { whereSql: `WHERE ${whereParts.join(" AND ")}`, params };
@@ -263,6 +268,7 @@ async function getBookingList(query = {}, currentUser = {}) {
       b.contact_email,
       b.accommodation_id,
       a.accommodation_name,
+      manager.full_name AS manager_full_name,
       b.check_in_date,
       b.check_out_date,
       b.total_nights,
@@ -277,6 +283,8 @@ async function getBookingList(query = {}, currentUser = {}) {
       room_type_names.names AS room_type_names
     FROM dbo.bookings b
     JOIN dbo.accommodations a ON a.id = b.accommodation_id
+    LEFT JOIN dbo.accommodation_managers am ON am.accommodation_id = a.id
+    LEFT JOIN dbo.users manager ON manager.id = am.user_id
     OUTER APPLY (
       SELECT STRING_AGG(rt.name, ', ') AS names
       FROM (
@@ -333,6 +341,7 @@ function mapBookingDetail(row, items) {
     accommodation: {
       id: row.accommodation_id,
       name: row.accommodation_name,
+      managerName: row.manager_full_name ?? null,
       phone: row.accommodation_phone,
       email: row.accommodation_email,
       addressLine: row.accommodation_address,
@@ -348,6 +357,8 @@ function mapBookingDetail(row, items) {
       childrenCount: row.total_children,
       checkedInAt: toIsoString(row.checked_in_at),
       checkedOutAt: toIsoString(row.checked_out_at),
+      checkedInByName: row.checked_in_by_name ?? null,
+      checkedOutByName: row.checked_out_by_name ?? null,
       operationalStatus: getOperationalStatus(row),
     },
     pricing: {
@@ -421,8 +432,13 @@ async function getBookingDetail(bookingId, currentUser = {}) {
       b.pending_expires_at,
       b.checked_in_at,
       b.checked_out_at,
+      b.checked_in_by,
+      b.checked_out_by,
+      checkedInBy.full_name AS checked_in_by_name,
+      checkedOutBy.full_name AS checked_out_by_name,
       b.accommodation_id,
       a.accommodation_name,
+      manager.full_name AS manager_full_name,
       a.phone AS accommodation_phone,
       a.email AS accommodation_email,
       a.address_line AS accommodation_address,
@@ -430,6 +446,10 @@ async function getBookingDetail(bookingId, currentUser = {}) {
       a.check_out_time AS accommodation_check_out_time
     FROM dbo.bookings b
     JOIN dbo.accommodations a ON a.id = b.accommodation_id
+    LEFT JOIN dbo.accommodation_managers am ON am.accommodation_id = a.id
+    LEFT JOIN dbo.users manager ON manager.id = am.user_id
+    LEFT JOIN dbo.users checkedInBy ON checkedInBy.id = b.checked_in_by
+    LEFT JOIN dbo.users checkedOutBy ON checkedOutBy.id = b.checked_out_by
     WHERE b.id = @bookingId
       AND ${scope.condition};
   `);
