@@ -427,6 +427,8 @@ function validateCheckoutForm(body) {
     const errors = {};
     const fields = {};
 
+    console.log("[validateCheckoutForm] Data cua body : ", body);
+
     const phone = value => /^\+?[0-9\s().-]{7,25}$/.test(value) &&
         (value.match(/\d/g) || []).length >= 7 &&
         (value.match(/\d/g) || []).length <= 16;
@@ -456,6 +458,9 @@ function validateCheckoutForm(body) {
     if (typeof body.is_booking_for_other !== "boolean") {
         errors.is_booking_for_other = "Vui lòng chọn người đại diện nhận phòng.";
     }
+    else {
+        fields.is_booking_for_other = body.is_booking_for_other;
+    }
 
     if (body.is_booking_for_other === true) {
         field("guest_name", 255, true);
@@ -482,6 +487,8 @@ function validateCheckoutForm(body) {
             errors
         );
     }
+
+    console.log("[validateCheckoutForm] Data cua fields : ", fields);
 
     return fields;
 }
@@ -549,11 +556,13 @@ function buildVnpayUrl(payment, bookingId, ipAddress) {
 async function createProcessingPayment(transaction, bookingId, form) {
     const request = bookingRequest(transaction, bookingId)
         .input("paymentCode", sql.VarChar(150), "PAY-" + randomBytes(16).toString("hex"))
+        .input("paymentCodeSuffix", sql.VarChar(16), randomBytes(8).toString("hex").toUpperCase())
         .input("suffix", sql.VarChar(12), randomBytes(6).toString("hex").toUpperCase())
         .input("minutes", sql.Int, PAYMENT_MINUTES)
         .input("contactName", sql.NVarChar(255), form.contact_name)
         .input("contactEmail", sql.VarChar(255), form.contact_email)
         .input("contactPhone", sql.VarChar(30), form.contact_phone)
+        .input("isBookingForOther", sql.Bit, form.is_booking_for_other)
         .input("guestName", sql.NVarChar(255), form.guest_name)
         .input("guestEmail", sql.VarChar(255), form.guest_email)
         .input("guestPhone", sql.VarChar(30), form.guest_phone)
@@ -572,6 +581,7 @@ async function createProcessingPayment(transaction, bookingId, form) {
             contact_name = @contactName,
             contact_email = @contactEmail,
             contact_phone = @contactPhone,
+            is_booking_for_other = @isBookingForOther,
             guest_name = @guestName,
             guest_email = @guestEmail,
             guest_phone = @guestPhone,
@@ -599,7 +609,8 @@ async function createProcessingPayment(transaction, bookingId, form) {
         WHERE id = CONVERT(BIGINT, @bookingId);
 
         UPDATE p
-        SET provider_order_id = CONCAT('VP', CONVERT(VARCHAR(19), p.id), @stamp, @suffix)
+        SET payment_code = CONCAT('PAY-', CONVERT(VARCHAR(19), p.id), '-', @paymentCodeSuffix),
+            provider_order_id = CONCAT('VP', CONVERT(VARCHAR(19), p.id), @stamp, @suffix)
         FROM dbo.payments p
         JOIN @inserted i ON i.id = p.id;
 
