@@ -1,9 +1,7 @@
-//import sql from "mssql";
-//import { getPool } from "../config/database.js";
-
 const { sqlObj, getDBPool } = require("../configs/database");
 
 const { randomInt, randomUUID } = require("node:crypto");
+const { createBookingCheckout } = require("./booking_checkout_service");
 
 const DAY_MS = 86_400_000;
 const MAX_STAY_NIGHTS = 90;
@@ -1022,5 +1020,6 @@ async function savePendingBooking(draftBooking, customerId) {
 
 module.exports = {
     getBookingPreview,
-    savePendingBooking
+    savePendingBooking,
+    ...createBookingCheckout(reconcileSelectedRooms),
 };
