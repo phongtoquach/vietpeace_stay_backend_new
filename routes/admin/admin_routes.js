@@ -46,6 +46,13 @@ const dashboardAdminRoutes = require("./dashboard_admin_routes");
 router.use("/dashboard", requireAdminLogin, dashboardAdminRoutes);
 
 /**
+ * ADMIN REPORTS
+ * /api/admin/reports/*
+ */
+const reportAdminRoutes = require("./report_admin_routes");
+router.use("/reports", requireAdminLogin, reportAdminRoutes);
+
+/**
  * LOOKUP (Tỉnh/Thành phố, Loại hình, Tiện ích, ...)
  * /api/admin/lookup/*
  */

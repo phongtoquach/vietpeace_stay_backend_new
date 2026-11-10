@@ -66,7 +66,7 @@ async function findAccessibleAccommodation(
     }
 
     const result = await request.query(`
-        SELECT a.id
+        SELECT a.id, a.accommodation_name AS name
         FROM dbo.accommodations a
         WHERE a.id = @accommodationId
           ${includeDeletedForAdmin ? "" : "AND a.deleted_at IS NULL"}
