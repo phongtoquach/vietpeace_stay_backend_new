@@ -278,6 +278,59 @@ function serializeBooking(booking, items) {
     };
 }
 
+
+async function checkStoredBookingRooms(
+    transaction,
+    bookingId,
+    bookingRow,
+    reconcileSelectedRooms
+) {
+    const items = await loadItems(transaction, bookingId);
+    const roomAvailability = await loadRoomAvailability(transaction, bookingId);
+
+    const availableByType = new Map(
+        roomAvailability.map(room => [
+            room.roomTypeId,
+            room.availableRooms,
+        ])
+    );
+
+    const roomById = new Map();
+
+    const selectedRooms = items.map(item => {
+        if (item.max_occupancy != null && !roomById.has(item.room_type_id)) {
+            roomById.set(item.room_type_id, {
+                name: item.room_type_name,
+                maxAdults: item.max_adults,
+                maxChildren: item.max_children,
+                maxOccupancy: item.max_occupancy,
+                availableQuantity: availableByType.get(item.room_type_id) ?? 0,
+            });
+        }
+
+        return {
+            roomTypeId: item.room_type_id,
+            adults: item.adults,
+            children: item.children,
+        };
+    });
+
+    const { validRooms } = reconcileSelectedRooms(selectedRooms, roomById);
+
+    const totalAdults = items.reduce((sum, item) => sum + item.adults, 0);
+    const totalChildren = items.reduce((sum, item) => sum + item.children, 0);
+
+    const roomsValid =
+        items.length > 0 &&
+        items.length === bookingRow.total_rooms &&
+        totalAdults === bookingRow.total_adults &&
+        totalChildren === bookingRow.total_children &&
+        validRooms.length === items.length;
+
+    return { items, roomAvailability, roomsValid };
+}
+
+
 async function inspectCheckout(transaction, bookingId, customerId, reconcileSelectedRooms) {
     const row = await loadBooking(transaction, bookingId, customerId);
 
@@ -695,6 +748,9 @@ function createBookingCheckout(reconcileSelectedRooms) {
 
         startVnpayCheckout: (bookingId, customerId, body, ipAddress) =>
             startVnpayCheckout(reconcileSelectedRooms, bookingId, customerId, body, ipAddress),
+
+        checkStoredBookingRooms: (transaction, bookingId, bookingRow) =>
+            checkStoredBookingRooms(transaction, bookingId, bookingRow, reconcileSelectedRooms),
     };
 }
 

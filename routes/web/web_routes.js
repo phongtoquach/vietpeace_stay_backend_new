@@ -50,6 +50,14 @@ router.use("/booking", bookingWebRoutes);
 
 
 /**
+ * Payment
+ * /api/web/payment/*
+ */
+const paymentWebRoutes = require("./payment_web_routes");
+router.use("/payment", paymentWebRoutes);
+
+
+/**
  * [PUBLIC APIS] Các API để lookup
  * 
 */
