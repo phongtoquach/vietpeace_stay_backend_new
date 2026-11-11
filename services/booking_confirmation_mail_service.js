@@ -65,9 +65,15 @@ async function loadConfirmationData(pool, bookingId) {
                 CONVERT(CHAR(10), b.check_in_date, 23) AS checkin,
                 CONVERT(CHAR(10), b.check_out_date, 23) AS checkout,
                 a.accommodation_name,
-                a.address_line
+                a.address_line,
+                loc.name AS location_name,
+                province.full_name AS loc_province_fullname,
+                ward.full_name AS loc_ward_fullname
             FROM dbo.bookings AS b
             JOIN dbo.accommodations AS a ON a.id = b.accommodation_id
+            LEFT JOIN dbo.locations AS loc ON loc.id = a.location_id
+            LEFT JOIN dbo.provinces AS province ON province.id = loc.province_id
+            LEFT JOIN dbo.wards AS ward ON ward.id = a.ward_id
             WHERE b.id = CONVERT(BIGINT, @bookingId)
               AND b.status = 'CONFIRMED';
 
@@ -166,7 +172,8 @@ function buildConfirmationMessage({ booking, rooms }) {
 
     const stayRows = [
         ['Cơ sở lưu trú', booking.accommodation_name],
-        ['Địa chỉ', booking.address_line],
+        ['Điểm đến', booking.location_name],
+        ['Địa chỉ', booking.address_line + ', ' + booking.loc_ward_fullname + ', ' + booking.loc_province_fullname],
         ['Nhận phòng', formatDate(booking.checkin)],
         ['Trả phòng', formatDate(booking.checkout)],
         ['Kỳ lưu trú', `${booking.total_nights} đêm · ${booking.total_rooms} phòng`],
