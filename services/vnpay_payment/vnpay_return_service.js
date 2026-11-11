@@ -394,6 +394,7 @@ async function finalizePayment(pool, event, customerId) {
         }
 
         if (payment.status === 'SUCCESS' && booking.status === 'CONFIRMED') {
+            console.log("[finalizePayment] payment.status = " + payment.status + " ; booking.status = " + booking.status + " ! Booking này đã được confirmed rồi, nên ko cần check tiếp nữa ! Return ngay !");
             return confirmedView(booking, customerId);
         }
 
@@ -445,9 +446,19 @@ async function finalizePayment(pool, event, customerId) {
 
         await recordPaid(tx, payment, event, canConfirm, isCurrent);
 
-        return canConfirm
-            ? confirmedView(booking, customerId)
-            : { state: 'REFUND_PENDING', refundId: payment.id };
+        console.log("[finalizePayment] Value của canConfirm là : ", canConfirm);
+        if (canConfirm) {
+            console.log("[finalizePayment] canConfirm = true ! Return state = CONFIRMED !");
+            return confirmedView(booking, customerId);
+        }
+        else {
+            console.log("[finalizePayment] canConfirm = false ! Return state = REFUND_PENDING va refundId " + payment.id);
+            return { state: 'REFUND_PENDING', refundId: payment.id };
+        }
+
+        // return canConfirm
+        //     ? confirmedView(booking, customerId)
+        //     : { state: 'REFUND_PENDING', refundId: payment.id };
     });
 }
 
@@ -618,7 +629,12 @@ async function verifyReturn(body, { customerId, ipAddress } = {}) {
     const pool = await getDBPool();
     const result = await finalizePayment(pool, event, customerId);
 
-    if (!result.refundId) return result;
+    console.log("[verifyReturn service] Data của result sau khi chạy finalizePayment() : ", result);
+
+    if (!result.refundId) {
+        console.log("[verifyReturn service] Trong result không có refundId ! Return result ngay !");
+        return result;
+    }
 
     try {
         const refunded = await sendPendingRefund(

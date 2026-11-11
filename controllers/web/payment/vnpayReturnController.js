@@ -9,6 +9,8 @@ async function verifyReturn(req, res) {
             ipAddress: req.ip,
         });
 
+        console.log("[verifyReturn] Value của data sau khi chạy hàm service verifyReturn() : ", data);
+
         return res.json({ success: true, data });
     } catch (error) {
         if (error.statusCode === 400) {
