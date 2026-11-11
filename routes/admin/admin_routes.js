@@ -102,4 +102,11 @@ router.use("/attractions", requireAdminLogin, attractionAdminRoutes);
 const amenityAdminRoutes = require("./amenity_admin_routes");
 router.use("/amenities", requireAdminLogin, amenityAdminRoutes);
 
+/**
+ * ADMIN CHATBOT SUPPORT INBOX
+ * /api/admin/chatbot/*
+ */
+const chatbotAdminRoutes = require("./chatbot_admin_routes");
+router.use("/chatbot", requireAdminLogin, chatbotAdminRoutes);
+
 module.exports = router;

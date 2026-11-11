@@ -6,6 +6,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "test:handover": "node --test test/manager_handover.test.js",
+    "test:chatbot": "node --test test/chatbot_rule_guard.test.js test/chatbot_model_schema.test.js test/chatbot_admin_service.test.js test/chatbot_pipeline.test.js",
     "start": "node server.js",
     "dev": "node --watch server.js"
   },
