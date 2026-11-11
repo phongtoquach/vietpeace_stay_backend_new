@@ -448,17 +448,18 @@ async function finalizePayment(pool, event, customerId) {
 
         console.log("[finalizePayment] Value của canConfirm là : ", canConfirm);
         if (canConfirm) {
-            console.log("[finalizePayment] canConfirm = true ! Return state = CONFIRMED !");
-            return confirmedView(booking, customerId);
+            console.log("[finalizePayment] canConfirm = true ! Return state = CONFIRMED ! Value của payment.booking_id ", payment.booking_id);
+
+            //return confirmedView(booking, customerId);
+            return {
+                ...confirmedView(booking, customerId),
+                bookingIdToEmail: payment.booking_id
+            };
         }
         else {
             console.log("[finalizePayment] canConfirm = false ! Return state = REFUND_PENDING va refundId " + payment.id);
             return { state: 'REFUND_PENDING', refundId: payment.id };
         }
-
-        // return canConfirm
-        //     ? confirmedView(booking, customerId)
-        //     : { state: 'REFUND_PENDING', refundId: payment.id };
     });
 }
 
