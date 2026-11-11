@@ -205,24 +205,36 @@ function buildConfirmationMessage({ booking, rooms }) {
         ],
     }));
 
-    function renderTable(rows) {
-        const content = rows.map(([label, value]) => `
-            <tr>
-                <th
-                    scope="row"
-                    align="left"
-                    style="padding:7px 10px;border-bottom:1px solid #E2E8F0"
-                >
-                    ${escapeHtml(label)}
-                </th>
-                <td style="padding:7px 10px;border-bottom:1px solid #E2E8F0">
-                    ${escapeHtml(value)}
-                </td>
-            </tr>
-        `).join('');
+    function renderTable(rows, { highlightLast = false } = {}) {
+        const content = rows.map(([label, value], index) => {
+            const isLast = index === rows.length - 1;
+            const highlight = highlightLast && isLast;
+            const border = isLast ? 'none' : '1px solid #e7edf3';
+            const background = highlight ? '#edf7f2' : '#ffffff';
+            const valueColor = highlight ? '#146044' : '#18334a';
+
+            return `
+                <tr>
+                    <th scope="row" align="left" valign="top"
+                        style="width:44%;padding:11px 14px;border-bottom:${border};
+                            background:${background};color:#536577;font-size:13px;
+                            line-height:20px;font-weight:${highlight ? '700' : '400'};">
+                        ${escapeHtml(label)}
+                    </th>
+                    <td align="right" valign="top"
+                        style="padding:11px 14px;border-bottom:${border};
+                            background:${background};color:${valueColor};
+                            font-size:${highlight ? '17px' : '14px'};line-height:22px;
+                            font-weight:700;overflow-wrap:anywhere;">
+                        ${escapeHtml(value)}
+                    </td>
+                </tr>
+            `;
+        }).join('');
 
         return `
-            <table width="100%" cellspacing="0" style="border-collapse:collapse">
+            <table width="100%" cellpadding="0" cellspacing="0"
+                style="border-collapse:collapse;border:1px solid #e7edf3;">
                 ${content}
             </table>
         `;
@@ -231,38 +243,99 @@ function buildConfirmationMessage({ booking, rooms }) {
     const code = escapeHtml(booking.booking_code);
 
     const html = `
-        <div
-            lang="vi"
-            style="max-width:640px;margin:auto;padding:24px;color:#233B53;font:15px Arial,sans-serif"
-        >
-            <h1>Đặt phòng đã được xác nhận</h1>
-            <p>Cảm ơn quý khách đã đặt phòng tại VietPeace Stay.</p>
+        <div lang="vi" style="margin:0;padding:0;background:#eef3f7;
+                            color:#18334a;font-family:Arial,sans-serif;">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+                <tr>
+                    <td align="center" style="padding:24px 12px;">
+                        <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+                            style="max-width:640px;background:#ffffff;border:1px solid #dce5ed;">
+                            <tr>
+                                <td style="padding:28px 24px;background:#18334a;color:#ffffff;">
+                                    <p style="margin:0 0 10px;color:#f4d38a;font-size:13px;
+                                            font-weight:700;letter-spacing:1.5px;">
+                                        VIETPEACE STAY
+                                    </p>
+                                    <h1 style="margin:0;font-size:28px;line-height:35px;">
+                                        Đặt phòng đã được xác nhận
+                                    </h1>
+                                    <p style="margin:10px 0 0;color:#d8e5ef;font-size:14px;line-height:22px;">
+                                        ${escapeHtml(booking.accommodation_name)}
+                                        &nbsp;·&nbsp; ${escapeHtml(formatDate(booking.checkin))}
+                                        – ${escapeHtml(formatDate(booking.checkout))}
+                                    </p>
+                                </td>
+                            </tr>
 
-            <div
-                style="text-align:center;padding:16px;background:#F8FAFC;border:1px solid #E2E8F0"
-            >
-                <p>Mã đặt phòng</p>
-                <p style="font-size:20px;font-weight:bold">${code}</p>
-                <img
-                    src="cid:${QR_CID}"
-                    width="240"
-                    height="240"
-                    alt="Mã QR đặt phòng ${code}"
-                >
-                <p>Vui lòng xuất trình mã QR hoặc đọc mã đặt phòng tại quầy lễ tân.</p>
-            </div>
+                            <tr>
+                                <td style="padding:24px;">
+                                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+                                        style="background:#f7fafc;border:1px solid #dce5ed;">
+                                        <tr>
+                                            <td align="center" style="padding:20px 12px;">
+                                                <p style="margin:0 0 8px;color:#536577;font-size:12px;
+                                                        font-weight:700;letter-spacing:1px;">
+                                                    MÃ ĐẶT PHÒNG
+                                                </p>
+                                                <p style="margin:0 0 12px;color:#18334a;font-size:23px;
+                                                        line-height:30px;font-weight:700;overflow-wrap:anywhere;">
+                                                    ${code}
+                                                </p>
+                                                <img src="cid:${QR_CID}" width="200" height="200"
+                                                    alt="Mã QR đặt phòng ${code}"
+                                                    style="display:block;width:200px;max-width:100%;
+                                                            height:auto;margin:0 auto;border:0;">
+                                                <p style="margin:12px 0 0;color:#536577;
+                                                        font-size:13px;line-height:20px;">
+                                                    Xuất trình mã QR hoặc đọc mã đặt phòng tại quầy lễ tân.
+                                                </p>
+                                            </td>
+                                        </tr>
+                                    </table>
 
-            <h2>Thông tin lưu trú</h2>
-            ${renderTable(stayRows)}
+                                    <h2 style="margin:28px 0 10px;color:#18334a;font-size:19px;">
+                                        Thông tin lưu trú
+                                    </h2>
+                                    ${renderTable(stayRows)}
 
-            <h2>Chi tiết phòng</h2>
-            ${roomSections.map(room => `
-                <h3>${escapeHtml(room.title)}</h3>
-                ${renderTable(room.rows)}
-            `).join('')}
+                                    <h2 style="margin:28px 0 10px;color:#18334a;font-size:19px;">
+                                        Chi tiết phòng
+                                    </h2>
 
-            <h2>Chi tiết thanh toán</h2>
-            ${renderTable(totalRows)}
+                                    ${roomSections.map(room => `
+                                        <table role="presentation" width="100%"
+                                            cellpadding="0" cellspacing="0"
+                                            style="margin-bottom:14px;">
+                                            <tr>
+                                                <td style="padding:10px 14px;background:#eaf0f6;
+                                                        color:#18334a;font-size:14px;font-weight:700;">
+                                                    ${escapeHtml(room.title)}
+                                                </td>
+                                            </tr>
+                                            <tr>
+                                                <td>${renderTable(room.rows, { highlightLast: true })}</td>
+                                            </tr>
+                                        </table>
+                                    `).join('')}
+
+                                    <h2 style="margin:24px 0 10px;color:#18334a;font-size:19px;">
+                                        Chi tiết thanh toán
+                                    </h2>
+                                    ${renderTable(totalRows, { highlightLast: true })}
+                                </td>
+                            </tr>
+
+                            <tr>
+                                <td align="center" style="padding:18px 24px;background:#f7fafc;
+                                                        border-top:1px solid #dce5ed;
+                                                        color:#536577;font-size:13px;line-height:20px;">
+                                    Cảm ơn quý khách đã lựa chọn VietPeace Stay.
+                                </td>
+                            </tr>
+                        </table>
+                    </td>
+                </tr>
+            </table>
         </div>
     `;
 
@@ -333,7 +406,7 @@ async function sendBookingConfirmation(bookingId) {
         from: process.env.MAIL_FROM,
         to: contactEmail,
         bcc,
-        subject: `[VietPeace Stay] Xác nhận đặt phòng ${booking.booking_code}`,
+        subject: `[VietPeace Stay] Xác nhận đặt phòng tại ${booking.accommodation_name}`,
         html,
         text,
         attachments: [{
