@@ -49,6 +49,11 @@ function generateSlug(str) {
         .replace(/\s+/g, "-");
 }
 
+function isValidSearchKeywords(value) {
+    return value === undefined || value === null ||
+        (typeof value === "string" && value.trim().length <= 500);
+}
+
 // Hàm 1: Lấy danh sách điểm đến (kèm ảnh đại diện nếu có)
 async function getLocationsList(req, res) {
     try {
@@ -66,6 +71,7 @@ async function getLocationsList(req, res) {
                 l.slug AS code,
                 l.short_description,
                 l.description,
+                l.search_keywords,
                 l.is_featured,
                 l.sort_order,
                 l.is_active,
@@ -150,12 +156,20 @@ async function createLocation(req, res) {
             new_sub_region_name,
             short_description,
             description,
+            search_keywords,
             is_featured,
             sort_order,
             is_active,
             status,
             image
         } = req.body;
+
+        if (!isValidSearchKeywords(search_keywords)) {
+            return res.status(400).json({
+                success: false,
+                message: "Từ khóa tìm kiếm phải là chuỗi tối đa 500 ký tự."
+            });
+        }
 
         if (!name || !name.trim()) {
             return res.status(400).json({
@@ -236,18 +250,19 @@ async function createLocation(req, res) {
             .input("slug", sql.VarChar(255), slug)
             .input("short_description", sql.NVarChar(1000), short_description || null)
             .input("description", sql.NVarChar(sql.MAX), description || null)
+            .input("search_keywords", sql.NVarChar(500), search_keywords?.trim() || null)
             .input("is_featured", sql.Bit, is_featured ? 1 : 0)
             .input("sort_order", sql.Int, sort_order || 1)
             .input("is_active", sql.Bit, isActive)
             .query(`
                 INSERT INTO dbo.locations (
                     province_id, parent_id, name, slug, short_description,
-                    description, is_featured, sort_order, is_active, created_at
+                    description, search_keywords, is_featured, sort_order, is_active, created_at
                 )
                 OUTPUT INSERTED.*
                 VALUES (
                     @province_id, @parent_id, @name, @slug, @short_description,
-                    @description, @is_featured, @sort_order, @is_active, SYSDATETIME()
+                    @description, @search_keywords, @is_featured, @sort_order, @is_active, SYSDATETIME()
                 );
             `);
 
@@ -302,12 +317,20 @@ async function updateLocation(req, res) {
             new_sub_region_name,
             short_description,
             description,
+            search_keywords,
             is_featured,
             sort_order,
             is_active,
             status,
             image
         } = req.body;
+
+        if (!isValidSearchKeywords(search_keywords)) {
+            return res.status(400).json({
+                success: false,
+                message: "Từ khóa tìm kiếm phải là chuỗi tối đa 500 ký tự."
+            });
+        }
 
         let finalParentId = parent_id !== undefined ? parent_id : (parent_location_id !== undefined ? parent_location_id : null);
 
@@ -375,6 +398,8 @@ async function updateLocation(req, res) {
             .input("slug", sql.VarChar(255), slug)
             .input("short_description", sql.NVarChar(1000), short_description !== undefined ? short_description : curr.short_description)
             .input("description", sql.NVarChar(sql.MAX), description !== undefined ? description : curr.description)
+            .input("search_keywords", sql.NVarChar(500), search_keywords?.trim() || null)
+            .input("update_search_keywords", sql.Bit, search_keywords !== undefined)
             .input("is_featured", sql.Bit, is_featured !== undefined ? (is_featured ? 1 : 0) : curr.is_featured)
             .input("sort_order", sql.Int, sort_order !== undefined ? sort_order : curr.sort_order)
             .input("is_active", sql.Bit, isActive)
@@ -387,6 +412,7 @@ async function updateLocation(req, res) {
                     slug = @slug,
                     short_description = @short_description,
                     description = @description,
+                    search_keywords = CASE WHEN @update_search_keywords = 1 THEN @search_keywords ELSE search_keywords END,
                     is_featured = @is_featured,
                     sort_order = @sort_order,
                     is_active = @is_active,
