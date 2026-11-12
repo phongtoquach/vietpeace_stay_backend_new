@@ -543,15 +543,26 @@ async function settleRefund(pool, paymentId, responseCode, refunded) {
 }
 
 async function sendPendingRefund(pool, paymentId, ipAddress, { merchant, secret }) {
+    console.log("[sendPendingRefund] Đang chạy hàm sendPendingRefund() ! ");
+    console.log("[sendPendingRefund] bien env VNPAY_API_URL : ", process.env.VNPAY_API_URL);
+    console.log("[sendPendingRefund] paymentId : " + paymentId + " ; ipAddress : " + ipAddress);
+    console.log("[sendPendingRefund] merchant : " + merchant + " ; secret : " + secret);
+
     if (!process.env.VNPAY_API_URL) return false;
 
     const url = new URL(process.env.VNPAY_API_URL);
+
+    console.log("[sendPendingRefund] Value của url.protocol : ", url.protocol);
 
     if (url.protocol !== 'https:') {
         throw new Error('VNPAY_API_URL must use HTTPS.');
     }
 
+    console.log("[sendPendingRefund] chuan bi claimRefund() !");
+
     const job = await claimRefund(pool, paymentId);
+    console.log("[sendPendingRefund] Data cua job : ", job);
+
     if (!job) return false;
 
     // Giữ thứ tự các trường khi ký request refund.
@@ -578,6 +589,9 @@ async function sendPendingRefund(pool, paymentId, ipAddress, { merchant, secret 
         secret
     ).toString('hex');
 
+    console.log("[sendPendingRefund] URL cua request : ", url);
+    console.log("[sendPendingRefund] Data cua body trong request : ", request);
+
     const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -586,20 +600,30 @@ async function sendPendingRefund(pool, paymentId, ipAddress, { merchant, secret 
         redirect: 'error',
     });
 
+    console.log("[sendPendingRefund] Ket qua goi API : ", response);
+
     if (!response.ok) return false;
 
     const data = await response.json();
+
+    console.log("[sendPendingRefund] Data cua response : ", data);
+
     const fieldsAreScalar = data && REFUND_RESPONSE_FIELDS.every(key =>
         data[key] == null ||
         typeof data[key] === 'string' ||
         (typeof data[key] === 'number' && Number.isSafeInteger(data[key]))
     );
 
+    console.log("[sendPendingRefund] Value của fieldsAreScalar : ", fieldsAreScalar);
+
     if (!fieldsAreScalar) return false;
 
     const signed = REFUND_RESPONSE_FIELDS.map(key => data[key] ?? '').join('|');
 
+    console.log("[sendPendingRefund] Data của signed : ", signed);
+
     if (!matchesSignature(signed, data.vnp_SecureHash, secret)) {
+        console.log("[sendPendingRefund] matchesSignature() tra ve false ! return false ngay !");
         return false;
     }
 
@@ -613,6 +637,8 @@ async function sendPendingRefund(pool, paymentId, ipAddress, { merchant, secret 
         String(data.vnp_TransactionType) === '02' &&
         code === '00' &&
         String(data.vnp_TransactionStatus) === '00';
+
+    console.log("[sendPendingRefund] Value của biến refunded : ", refunded);
 
     await settleRefund(
         pool,
