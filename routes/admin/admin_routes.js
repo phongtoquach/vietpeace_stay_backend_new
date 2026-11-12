@@ -38,6 +38,14 @@ router.use("/accommodations", requireAdminLogin, accommodationAdminRoutes);
 const bookingAdminRoutes = require("./booking_admin_routes");
 router.use("/bookings", requireAdminLogin, bookingAdminRoutes);
 
+
+/**
+ * ADMIN CUSTOMERS
+ * /api/admin/customers/*
+ */
+const customerAdminRoutes = require("./customer_admin_routes");
+router.use("/customers", requireAdminLogin, customerAdminRoutes);
+
 /**
  * ADMIN DASHBOARD
  * /api/admin/dashboard/*
