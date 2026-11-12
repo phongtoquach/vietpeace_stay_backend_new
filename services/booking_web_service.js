@@ -90,7 +90,7 @@ function fromCents(value) {
     return value / 100;
 }
 
-async function loadRoomData(pool, accommodationId, stay, { includeActivePending = false } = {}) {
+async function loadRoomData(pool, accommodationId, stay) {
     const result = await pool.request()
         .input("accommodationId", sqlObj.Int, accommodationId)
         .input("checkin", sqlObj.VarChar(10), stay.checkinDate)
@@ -146,10 +146,7 @@ async function loadRoomData(pool, accommodationId, stay, { includeActivePending 
             JOIN dbo.booking_items AS bi ON bi.booking_id = b.id
             JOIN #ActiveRoomTypes AS active ON active.id = bi.room_type_id
             WHERE b.accommodation_id = @accommodationId
-              AND (
-                    b.status = 'CONFIRMED'
-                    ${includeActivePending ? "OR (b.status = 'PENDING' AND b.pending_expires_at > SYSDATETIME())" : ""}
-              )
+              AND b.status = 'CONFIRMED'
               AND b.check_in_date < @end
               AND b.check_out_date > @start
             GROUP BY bi.room_type_id, b.check_in_date, b.check_out_date;
@@ -1144,8 +1141,6 @@ async function getBookingDetail(bookingId, customerId) {
 
 module.exports = {
     getBookingPreview,
-    loadRoomData,
-    buildRoomTypes,
     savePendingBooking,
     getBookingDetail,
     ...createBookingCheckout(reconcileSelectedRooms),

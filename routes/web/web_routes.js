@@ -75,18 +75,10 @@ router.use("/locations", locationRoutes);
 
 
 /**
- * [PUBLIC APIS] Các API để test
+ * [PUBLIC APIS] Các API để test 
  */
 const testApiRoutes = require("./testapi_web_routes");
 router.use("/test", testApiRoutes);
-
-
-/**
- * CHATBOT
- * /api/web/chatbot/*
- */
-const chatbotWebRoutes = require("./chatbot_web_routes");
-router.use("/chatbot", chatbotWebRoutes);
 
 
 // export
