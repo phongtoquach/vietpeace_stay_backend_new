@@ -109,4 +109,11 @@ router.use("/amenities", requireAdminLogin, amenityAdminRoutes);
 const pricingAdminRoutes = require("./pricing_admin_routes");
 router.use("/pricing", requireAdminLogin, pricingAdminRoutes);
 
+/**
+ * ADMIN FINANCIAL REPORTS (P&L, BONUS TOP 1-3, 13TH SALARY & RECONCILIATION)
+ * /api/admin/financial-reports/*
+ */
+const financialReportAdminRoutes = require("./financial_report_admin_routes");
+router.use("/financial-reports", requireAdminLogin, financialReportAdminRoutes);
+
 module.exports = router;
