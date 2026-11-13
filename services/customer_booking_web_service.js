@@ -217,7 +217,21 @@ async function getCustomerBookings(filters, customerId) {
         );
     }
 
-    const { status = 'CONFIRMED', page = 1, pageSize = 10 } = filters;
+    let defaultPageSize = 3;
+    if (process.env.CUSTOMER_BOOKINGS_PAGESIZE) {
+        const configPageSize = Number(process.env.CUSTOMER_BOOKINGS_PAGESIZE);
+        console.log("[getCustomerBookings service] Value cua configPageSize : ", configPageSize);
+
+        if (Number.isInteger(configPageSize) && configPageSize >= 1 && configPageSize <= 100) {
+            console.log("[getCustomerBookings service] configPageSize hop le !");
+            defaultPageSize = configPageSize;
+        }
+    }
+    console.log("[getCustomerBookings service] Value sau cung cua defaultPageSize : ", defaultPageSize);
+
+    const { status = 'CONFIRMED', page = 1, pageSize = defaultPageSize } = filters;
+
+    console.log("[getCustomerBookings service] Value sau cung cua pageSize : ", pageSize);
 
     if (!['CONFIRMED', 'PENDING', 'PAYMENT_PROCESSING'].includes(status)) {
         throw Object.assign(
