@@ -1,4 +1,4 @@
-const accommodationSearchService = require("../../../services/accommodation_search_service");
+const accommodationSearchService = require("../../../services/accommodation_daily_search_service");
 
 async function searchAccommodations(req, res) {
     try {

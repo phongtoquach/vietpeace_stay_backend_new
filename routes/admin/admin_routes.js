@@ -102,4 +102,11 @@ router.use("/attractions", requireAdminLogin, attractionAdminRoutes);
 const amenityAdminRoutes = require("./amenity_admin_routes");
 router.use("/amenities", requireAdminLogin, amenityAdminRoutes);
 
+/**
+ * ADMIN PRICING & AVAILABILITY
+ * /api/admin/pricing/*
+ */
+const pricingAdminRoutes = require("./pricing_admin_routes");
+router.use("/pricing", requireAdminLogin, pricingAdminRoutes);
+
 module.exports = router;
