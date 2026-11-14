@@ -23,6 +23,8 @@ router.post("/change-password", customerController.changeAccountPassword);
 router.post("/bookings", customerBookingsController.getCustomerBookings);
 // API lấy thông tin chi tiết của 1 booking
 router.get("/bookings/booking/:bookingId", customerBookingsController.getBookingDetail);
+router.get("/bookings", customerBookingsController.listCustomerBookingsHandler);
+router.get("/bookings/:bookingId", customerBookingsController.getCustomerBookingDetail);
 
 
 // export

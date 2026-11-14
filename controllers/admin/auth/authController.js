@@ -1,5 +1,7 @@
 const authService = require("../../../services/auth_service");
 const permissionService = require("../../../services/permission_service");
+const { revokeUserAccess } = require("../../../services/chat/identity");
+const { triggerOutboxDrain } = require("../../../services/chat/runtime");
 
 async function login(req, res) {
     console.log("[authController - login] Value của req.body : ", req.body);
@@ -136,13 +138,19 @@ async function changeInitialPassword(req, res) {
 }
 
 async function logout(req, res) {
-    req.session.destroy((err) => {
+    const adminId = req.session?.admin?.id || null;
+    req.session.destroy(async (err) => {
         if (err) {
             console.log("[logout] Xoa session that bai ! Error : ", err);
             return res.status(500).json({
                 success: false,
                 message: err
             });
+        }
+
+        if (adminId) {
+            await revokeUserAccess(null, adminId, "LOGOUT", { audience: "admin" }).catch(() => {});
+            triggerOutboxDrain();
         }
 
         console.log("[logout] Xoa session thanh cong !");

@@ -3,16 +3,17 @@
  */
 
 const session = require("express-session");
+const { createSessionStore } = require("./sessionStore");
 
 const adminSession = session({
     name: "vietpeace.admin.sid",
     secret: process.env.ADMIN_SESSION_SECRET,
+    store: createSessionStore("admin"),
     resave: false,
     saveUninitialized: false,
     cookie: {
         httpOnly: true,
-        //secure: process.env.NODE_ENV === "production",
-        secure: false,  // trên production dùng https thì đổi thành true
+        secure: process.env.NODE_ENV === "production",
         sameSite: "lax",
         path: "/api/admin",
         maxAge: 1000 * 3600 * 24    // 24 hours

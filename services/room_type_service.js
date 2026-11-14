@@ -10,6 +10,7 @@ const {
 } = require("../constants/room_type");
 
 const sql = sqlObj;
+const pricing = require('./pricing_service');
 
 // Lỗi nghiệp vụ của module room type, controller đọc statusCode/errorCode
 // để trả đúng HTTP thay vì luôn 500.
@@ -933,6 +934,10 @@ async function createRoomType(body = {}, currentUser = {}) {
 
   try {
     const values = validateRoomTypePayload(body, { isCreate: true });
+    await pricing.access(getDBPool(), values.accommodationId, currentUser, true);
+    if (currentUser.role !== 'ADMIN') {
+      throw new RoomTypeServiceError(403, 'PRICE_APPROVAL_REQUIRED', 'Giá ban đầu của loại phòng mới cần admin thiết lập.');
+    }
     console.log("[1] payload hợp lệ:", Object.keys(values));
 
     await assertAccommodationAccess(values.accommodationId, currentUser);
@@ -946,6 +951,8 @@ async function createRoomType(body = {}, currentUser = {}) {
     let newId;
 
     try {
+      await pricing.lock(transaction);
+      await pricing.access(transaction, values.accommodationId, currentUser, true);
       const insertRequest = new sql.Request(transaction)
         .input("accommodationId", sql.Int, values.accommodationId)
         .input("code", sql.VarChar(255), values.code)
@@ -1009,6 +1016,16 @@ async function createRoomType(body = {}, currentUser = {}) {
       await replaceRoomTypeAmenities(transaction, newId, values.amenities);
       await replaceRoomTypeWeekdayRates(transaction, newId, values.weekdayRates || []);
 
+      await pricing.audit(
+        transaction,
+        currentUser,
+        values.accommodationId,
+        'create_room_rates',
+        'Giá ban đầu khi tạo loại phòng',
+        null,
+        { roomTypeId: newId, basePrice: values.basePrice, weekdayRates: values.weekdayRates }
+      );
+
       await transaction.commit();
       console.log("[2] đã commit, id:", newId);
     } catch (error) {
@@ -1045,6 +1062,31 @@ async function updateRoomType(id, body = {}, currentUser = {}) {
   try {
     const current = await getRoomTypeDetail(roomTypeId, currentUser);
     const values = validateRoomTypePayload(body, { isCreate: false });
+    const changesPricing = ['basePrice', 'extraAdultFee', 'extraChildFee'].some(
+      (k) => values[k] !== undefined && Number(values[k]) !== Number(current[k])
+    ) || (values.weekdayRates !== undefined && JSON.stringify(values.weekdayRates) !== JSON.stringify(current.weekdayRates));
+    if (changesPricing) {
+      await pricing.access(getDBPool(), current.accommodationId, currentUser, true);
+    }
+    if (changesPricing && currentUser.role !== 'ADMIN') {
+      throw new RoomTypeServiceError(
+        409,
+        'PRICE_APPROVAL_REQUIRED',
+        'Vui lòng gửi đề xuất tại Thiết lập giá. Giá chỉ thay đổi sau khi admin duyệt.'
+      );
+    }
+    if (values.accommodationId !== undefined && values.accommodationId !== current.accommodationId) {
+      const dependencies = await getDBPool().request()
+        .input('id', sql.Int, roomTypeId)
+        .query(`SELECT 1 AS found WHERE EXISTS(SELECT 1 FROM dbo.room_period_rates WHERE room_type_id=@id) OR EXISTS(SELECT 1 FROM dbo.room_weekday_rate_schedules WHERE room_type_id=@id) OR EXISTS(SELECT 1 FROM dbo.room_daily_rate_overrides WHERE room_type_id=@id);`);
+      if (dependencies.recordset.length) {
+        throw new RoomTypeServiceError(
+          409,
+          'PRICING_DEPENDENCIES',
+          'Loại phòng đã có cấu hình giá/tồn phòng. Không thể chuyển sang cơ sở khác.'
+        );
+      }
+    }
 
     // Policy P2: manager chỉ quản lý room type trong cơ sở được gán, không
     // được chuyển room type sang cơ sở khác. ADMIN được reassign toàn hệ thống.
@@ -1107,6 +1149,8 @@ async function updateRoomType(id, body = {}, currentUser = {}) {
     await transaction.begin(sql.ISOLATION_LEVEL.READ_COMMITTED);
 
     try {
+      await pricing.lock(transaction);
+      await pricing.access(transaction, current.accommodationId, currentUser, changesPricing);
       const currentScope = getAccommodationScope(currentUser, "rtaccom");
       const destinationScope = getAccommodationScope(currentUser, "dest");
       const updateRequest = new sql.Request(transaction)
@@ -1144,7 +1188,7 @@ async function updateRoomType(id, body = {}, currentUser = {}) {
               short_description = @shortDescription,
               description = @description,
               quantity = @quantity,
-              base_price = @basePrice,
+              base_price = ${currentUser.role === 'ADMIN' ? '@basePrice' : 'rt.base_price'},
               area_sqm = @areaSqm,
               bed_description = @bedDescription,
               bedroom_count = @bedroomCount,
@@ -1154,8 +1198,8 @@ async function updateRoomType(id, body = {}, currentUser = {}) {
               max_adults = @maxAdults,
               max_children = @maxChildren,
               max_occupancy = @maxOccupancy,
-              extra_adult_fee = @extraAdultFee,
-              extra_child_fee = @extraChildFee,
+              extra_adult_fee = ${currentUser.role === 'ADMIN' ? '@extraAdultFee' : 'rt.extra_adult_fee'},
+              extra_child_fee = ${currentUser.role === 'ADMIN' ? '@extraChildFee' : 'rt.extra_child_fee'},
               status = @status,
               sort_order = @sortOrder,
               updated_at = SYSDATETIME()
@@ -1189,11 +1233,45 @@ async function updateRoomType(id, body = {}, currentUser = {}) {
       if (values.amenities !== undefined) {
         await replaceRoomTypeAmenities(transaction, roomTypeId, values.amenities);
       }
-      if (values.weekdayRates !== undefined) {
+      if (values.weekdayRates !== undefined && currentUser.role === 'ADMIN') {
         await replaceRoomTypeWeekdayRates(
           transaction,
           roomTypeId,
           values.weekdayRates || [],
+        );
+      }
+
+      const pricingStart = pricing.today();
+      await pricing.validate(
+        transaction,
+        merged.accommodationId,
+        [roomTypeId],
+        pricingStart,
+        pricing.shift(pricingStart, 1095)
+      );
+      if (changesPricing || merged.quantity !== current.quantity) {
+        await pricing.audit(
+          transaction,
+          currentUser,
+          merged.accommodationId,
+          'update_room_rates',
+          'Thay đổi từ trang loại phòng',
+          {
+            roomTypeId,
+            basePrice: current.basePrice,
+            extraAdultFee: current.extraAdultFee,
+            extraChildFee: current.extraChildFee,
+            weekdayRates: current.weekdayRates,
+            quantity: current.quantity
+          },
+          {
+            roomTypeId,
+            basePrice: merged.basePrice,
+            extraAdultFee: merged.extraAdultFee,
+            extraChildFee: merged.extraChildFee,
+            weekdayRates: values.weekdayRates,
+            quantity: merged.quantity
+          }
         );
       }
 

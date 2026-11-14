@@ -5,6 +5,8 @@ const { getDBPool } = require('../configs/database');
 const { generateTemporaryPassword } = require('../utils/account_generator');
 const { sendAccountProvisionEmail } = require('./mail_service');
 const { encryptPassword, decryptPassword } = require('./handover_credentials_service');
+const { syncManagerEpochInTransaction } = require('./chat/lifecycle');
+const { triggerOutboxDrain } = require('./chat/runtime');
 
 function failure(statusCode, errorCode, message) {
     return Object.assign(new Error(message), { statusCode, errorCode });
@@ -152,7 +154,14 @@ async function assignAccommodationManager(value, profile = {}, admin, options = 
                 INSERT INTO dbo.manager_handover_credentials (user_id, encrypted_password, expires_at)
                 VALUES (@userId, @encryptedPassword, DATEADD(day, 7, SYSUTCDATETIME()));`);
         user = { userId, internalEmail, ...details };
+        await syncManagerEpochInTransaction(transaction, {
+            accommodationId: id,
+            newManagerUserId: userId,
+            reason: replacing ? 'MANAGER_REPLACED' : 'MANAGER_ASSIGNED',
+            actorAdminId: admin.id,
+        });
         await transaction.commit();
+        triggerOutboxDrain();
     } catch (error) {
         try { await transaction.rollback(); } catch { /* Preserve the original error. */ }
         if ([2601, 2627, 1205].includes(error.number)) {

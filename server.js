@@ -1,6 +1,7 @@
 //require("dotenv").config();
 require("dotenv/config");
 
+const http = require("http");
 const { sqlObj, connectDB } = require("./configs/database");
 
 const express = require("express");
@@ -14,6 +15,8 @@ const adminSession = require("./configs/adminSession");
 // import bộ routes của phần Web & phần Admin Panel
 const webRoutes = require("./routes/web/web_routes");
 const adminRoutes = require("./routes/admin/admin_routes");
+const { createWebChatRouter, createAdminChatRouter } = require("./routes/chat_routes");
+const { attachChatSocket, stopWorkers } = require("./services/chat/runtime");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -42,17 +45,41 @@ app.use("/uploads", express.static(path.join(__dirname, "public", "uploads")));
 
 
 // chỉ định tất cả API của phần Web (có prefix "/api/web/*") phải áp dụng Customer Session & toàn bộ route trong webRoutes 
+app.use("/api/web/chat", customerSession, createWebChatRouter());
 app.use("/api/web", customerSession, webRoutes);
 
 // chỉ định tất cả API của phần Web (có prefix "/api/admin/*") phải áp dụng Admin Session & toàn bộ route trong adminRoutes
+app.use("/api/admin/chat", adminSession, createAdminChatRouter());
 app.use("/api/admin", adminSession, adminRoutes);
 
-async function startServer() {
+async function startServer({ port = PORT } = {}) {
     await connectDB();
 
-    app.listen(PORT, () => {
-        console.log(`App đang run trên server bind với domain http://localhost:${PORT}`);
+    const httpServer = http.createServer(app);
+    attachChatSocket(httpServer);
+
+    await new Promise((resolve) => {
+        httpServer.listen(port, () => {
+            const addr = httpServer.address();
+            const boundPort = typeof addr === "object" && addr ? addr.port : port;
+            console.log(`App đang run trên server bind với domain http://localhost:${boundPort}`);
+            resolve();
+        });
+    });
+
+    const stop = async () => {
+        stopWorkers();
+        await new Promise((resolve) => httpServer.close(() => resolve()));
+    };
+
+    return { app, httpServer, stop };
+}
+
+if (require.main === module) {
+    startServer().catch((err) => {
+        console.error("[Server] Failed to start:", err);
+        process.exit(1);
     });
 }
 
-startServer();
+module.exports = { app, startServer };

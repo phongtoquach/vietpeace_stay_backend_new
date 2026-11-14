@@ -3,6 +3,8 @@ const bcrypt = require("bcryptjs");
 const { getDBPool } = require("../configs/database");
 const { generateTemporaryPassword, generateUniqueInternalEmail } = require("../utils/account_generator");
 const { sendPasswordResetEmail } = require("./mail_service");
+const { revokeUserAccess } = require("./chat/identity");
+const { triggerOutboxDrain } = require("./chat/runtime");
 
 /**
  * Lấy danh sách tài khoản quản trị (ADMIN và ACCOMMODATION_MANAGER)
@@ -273,6 +275,11 @@ async function updateAdminUser(targetUserId, { fullName, personalEmail, phoneNum
             WHERE id = @id;
         `);
 
+    if (newStatus !== 1) {
+        await revokeUserAccess(null, targetUserId, "USER_LOCKED").catch(() => {});
+        triggerOutboxDrain();
+    }
+
     return {
         id: targetUserId,
         fullName: fullName.trim(),
@@ -316,6 +323,11 @@ async function toggleUserStatus(targetUserId, currentAdmin) {
                 updated_at = SYSDATETIME()
             WHERE id = @id;
         `);
+
+    if (newStatus !== 1) {
+        await revokeUserAccess(null, targetUserId, "USER_LOCKED").catch(() => {});
+        triggerOutboxDrain();
+    }
 
     return {
         id: targetUserId,
@@ -491,6 +503,9 @@ async function deleteAdminUser(targetUserId, currentAdmin) {
             .request()
             .input("userId", sql.UniqueIdentifier, targetUserId)
             .query("UPDATE dbo.users SET status = 2, updated_at = SYSDATETIME() WHERE id = @userId;");
+
+        await revokeUserAccess(null, targetUserId, "USER_DEACTIVATED").catch(() => {});
+        triggerOutboxDrain();
 
         return {
             id: targetUserId,
