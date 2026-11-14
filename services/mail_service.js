@@ -517,10 +517,102 @@ async function sendChatCskhWarningEmail({
     return { success: true, method: "dev_log" };
 }
 
+/**
+ * Gửi email xác thực tài khoản khách hàng sau khi đăng ký
+ */
+async function sendCustomerVerificationEmail({
+    toEmail,
+    fullName,
+    verificationUrl,
+    expiresInHours = 24,
+}) {
+    const safeName = escapeMailHtml(fullName || "Quý khách");
+    const safeEmail = escapeMailHtml(toEmail || "");
+    const safeUrl = escapeMailHtml(verificationUrl || "");
+    const hours = Number(expiresInHours) || 24;
+    const subject = "[VietPeace Stay] Xác thực địa chỉ email tài khoản của bạn";
+
+    const textContent = [
+        `Xin chào ${fullName || "Quý khách"},`,
+        "",
+        "Cảm ơn bạn đã đăng ký tài khoản tại VietPeace Stay.",
+        `Vui lòng truy cập liên kết sau để xác thực email và kích hoạt tài khoản (có hiệu lực trong ${hours} giờ):`,
+        verificationUrl,
+        "",
+        "Nếu bạn không thực hiện đăng ký tài khoản này, vui lòng bỏ qua email này.",
+    ].join("\n");
+
+    const htmlContent = `
+        <div style="font-family: Arial, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #292D32; max-width: 620px; margin: 0 auto; border: 1px solid #E5E7EB; border-radius: 10px; overflow: hidden; background-color: #ffffff; box-shadow: 0 4px 12px rgba(0,0,0,0.06);">
+            <div style="background: linear-gradient(135deg, #173B2B 0%, #233B53 100%); color: #ffffff; padding: 28px 24px; text-align: center; border-bottom: 3px solid #F5B82E;">
+                <h1 style="margin: 0; font-size: 22px; font-weight: 800; letter-spacing: 0.5px; text-transform: uppercase;">VIETPEACE STAY</h1>
+                <p style="margin: 6px 0 0; font-size: 13.5px; color: #FEF3C7; opacity: 0.95; font-weight: 500;">XÁC THỰC ĐỊA CHỈ EMAIL TÀI KHOẢN KHÁCH HÀNG</p>
+            </div>
+
+            <div style="padding: 28px 24px;">
+                <p style="margin-top: 0; font-size: 15px;">Xin chào <strong>${safeName}</strong>,</p>
+                <p style="font-size: 14.5px; color: #374151;">
+                    Cảm ơn bạn đã đăng ký tài khoản thành viên tại <strong>VietPeace Stay</strong> với email <strong>${safeEmail}</strong>.
+                    Để hoàn tất đăng ký và bắt đầu đặt phòng, vui lòng xác thực địa chỉ email của bạn bằng nút bên dưới.
+                </p>
+
+                <div style="background-color: #FFFDF7; border: 1px solid #FDE68A; border-radius: 8px; padding: 22px 20px; margin: 24px 0; text-align: center;">
+                    <a href="${safeUrl}" style="background-color: #F5B82E; color: #173B2B; text-decoration: none; font-weight: 800; font-size: 15px; padding: 13px 28px; border-radius: 8px; display: inline-block; border: 1px solid #D99B16;">
+                        Xác thực Email ngay &rarr;
+                    </a>
+                    <p style="margin: 14px 0 0; font-size: 12.5px; color: #6B7280;">
+                        Liên kết xác thực có hiệu lực trong vòng <strong>${hours} giờ</strong> và chỉ sử dụng một lần.
+                    </p>
+                </div>
+
+                <p style="font-size: 13px; color: #4B5563; margin-bottom: 8px;">
+                    Nếu nút bấm không hoạt động, bạn có thể sao chép và dán đường dẫn sau vào trình duyệt:
+                </p>
+                <p style="font-size: 12.5px; color: #0284C7; word-break: break-all; background-color: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 6px; padding: 10px 12px; margin-top: 0;">
+                    <a href="${safeUrl}" style="color: #0284C7; text-decoration: underline;">${safeUrl}</a>
+                </p>
+
+                <p style="font-size: 13px; color: #64748B; margin-bottom: 0; margin-top: 20px;">
+                    Nếu bạn không yêu cầu tạo tài khoản tại VietPeace Stay, vui lòng bỏ qua email này. Tài khoản sẽ không được kích hoạt nếu chưa xác thực.
+                </p>
+            </div>
+
+            <div style="background-color: #F8FAFC; border-top: 1px solid #E2E8F0; padding: 16px 20px; text-align: center; font-size: 12px; color: #64748B;">
+                © VietPeace Stay Hospitality. Email tự động, vui lòng không trả lời thư này.
+            </div>
+        </div>
+    `;
+
+    const transporter = getTransporter();
+
+    if (transporter) {
+        try {
+            const info = await transporter.sendMail({
+                from: process.env.MAIL_FROM?.trim() || `"VietPeace Stay" <${process.env.SMTP_USER}>`,
+                to: toEmail,
+                subject,
+                text: textContent,
+                html: htmlContent,
+            });
+            if (!info.accepted?.some((address) => String(address).toLowerCase() === String(toEmail).toLowerCase())) {
+                return { success: false, method: "smtp_rejected" };
+            }
+            return { success: true, method: "smtp" };
+        } catch (error) {
+            console.error("[MailService] Gửi email xác thực khách hàng thất bại:", error.code || error.message || "SMTP_ERROR");
+            return { success: false, method: "smtp_error", error: error.message || "SMTP_SEND_ERROR" };
+        }
+    }
+
+    console.warn(`[MailService] Chưa cấu hình SMTP nên không thể gửi email xác thực đến ${toEmail}`);
+    return { success: false, method: "smtp_not_configured" };
+}
+
 module.exports = {
     sendAccountProvisionEmail,
     sendPasswordResetEmail,
     sendManagerFinancialWarningEmail,
     sendManagerBonusAndTetRewardEmail,
     sendChatCskhWarningEmail,
+    sendCustomerVerificationEmail,
 };
