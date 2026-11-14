@@ -21,6 +21,7 @@ router.post("/change-password", customerController.changeAccountPassword);
 
 // API lấy danh sách các booking của user login
 router.get("/bookings", customerBookingsController.getCustomerBookings);
+router.get("/bookings/:bookingId", customerBookingsController.getCustomerBookingDetail);
 
 
 // export

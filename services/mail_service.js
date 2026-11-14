@@ -458,9 +458,69 @@ async function sendManagerBonusAndTetRewardEmail({
     return { success: true, method: "dev_log" };
 }
 
+/**
+ * Gửi email cảnh báo chất lượng CSKH khi đánh giá chat 1-3 sao được xác nhận vi phạm
+ */
+async function sendChatCskhWarningEmail({
+    toGmail,
+    managerName,
+    accommodationName,
+    rating,
+    customerComment,
+    adminNote,
+}) {
+    const adminUrl = process.env.ADMIN_PANEL_DOMAIN || "http://localhost:5175";
+    const subject = `[VietPeace Stay CSKH] Nhắc nhở chất lượng tư vấn (${rating}/5 sao) — ${accommodationName}`;
+    const safeName = escapeMailHtml(managerName || "Quản lý cơ sở");
+    const safeAccom = escapeMailHtml(accommodationName || "Cơ sở lưu trú");
+    const safeComment = escapeMailHtml(customerComment || "(Khách không để lại nhận xét thêm)");
+    const safeNote = escapeMailHtml(adminNote || "Vui lòng rà soát tốc độ phản hồi và thái độ phục vụ khách trên hệ thống Chat.");
+
+    const htmlContent = `
+        <div style="font-family: Arial, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #292D32; max-width: 620px; margin: 0 auto; border: 1px solid #E5E7EB; border-radius: 10px; overflow: hidden; background-color: #ffffff;">
+            <div style="background: linear-gradient(135deg, #233B53 0%, #172A3C 100%); color: #ffffff; padding: 24px; text-align: center; border-bottom: 3px solid #F5B82E;">
+                <h1 style="margin: 0; font-size: 20px; font-weight: 800;">VIETPEACE STAY CSKH</h1>
+                <p style="margin: 6px 0 0; font-size: 13px; color: #FFF1C2;">THÔNG BÁO RÀ SOÁT CHẤT LƯỢNG TƯ VẤN KHÁCH HÀNG</p>
+            </div>
+            <div style="padding: 24px;">
+                <p style="margin-top: 0;">Xin chào <strong>${safeName}</strong>,</p>
+                <p>Hệ thống vừa ghi nhận một đánh giá <strong>${Number(rating)}/5 sao</strong> đối với phiên tư vấn trực tuyến tại cơ sở <strong>${safeAccom}</strong> đã được Quản trị viên xác nhận cần rút kinh nghiệm:</p>
+                <div style="background-color: #FFF9ED; border-left: 4px solid #F5B82E; padding: 12px 14px; border-radius: 6px; margin: 16px 0;">
+                    <div style="font-size: 12px; font-weight: 700; color: #92400E; margin-bottom: 4px;">PHẢN HỒI CỦA KHÁCH HÀNG</div>
+                    <div style="color: #1F2937;">${safeComment}</div>
+                </div>
+                <div style="background-color: #FEF2F2; border-left: 4px solid #C0392B; padding: 12px 14px; border-radius: 6px; margin: 16px 0;">
+                    <div style="font-size: 12px; font-weight: 700; color: #991B1B; margin-bottom: 4px;">CHỈ ĐẠO TỪ QUẢN TRỊ VIÊN</div>
+                    <div style="color: #1F2937;">${safeNote}</div>
+                </div>
+                <div style="text-align: center; margin-top: 22px;">
+                    <a href="${adminUrl}/chat" style="background-color: #F4C542; color: #24220A; text-decoration: none; font-weight: 700; font-size: 14px; padding: 10px 24px; border-radius: 6px; display: inline-block;">
+                        Mở Trung tâm CSKH VietPeace Stay &rarr;
+                    </a>
+                </div>
+            </div>
+        </div>
+    `;
+
+    const transporter = getTransporter();
+    if (transporter) {
+        await transporter.sendMail({
+            from: process.env.MAIL_FROM || `"VietPeace Stay CSKH" <${process.env.SMTP_USER}>`,
+            to: toGmail,
+            subject,
+            html: htmlContent,
+        });
+        return { success: true, method: "smtp" };
+    }
+
+    console.log(`\n📨 [DEV LOG] CHAT CSKH WARNING EMAIL -> ${toGmail} (${safeAccom}, ${rating} sao)\n`);
+    return { success: true, method: "dev_log" };
+}
+
 module.exports = {
     sendAccountProvisionEmail,
     sendPasswordResetEmail,
     sendManagerFinancialWarningEmail,
     sendManagerBonusAndTetRewardEmail,
+    sendChatCskhWarningEmail,
 };

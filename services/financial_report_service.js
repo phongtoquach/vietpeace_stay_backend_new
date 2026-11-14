@@ -1520,7 +1520,7 @@ async function loadChatboxViolationsIfExists(pool, periodStart, periodEnd) {
         SELECT DISTINCT manager_user_id
         FROM dbo.chat_conversation_ratings
         WHERE manager_user_id IS NOT NULL
-          AND review_status = 'CONFIRMED_VIOLATION'
+          AND admin_review_status = 'CONFIRMED_VIOLATION'
           AND created_at >= @periodStart
           AND created_at < @periodEnd;
       `);

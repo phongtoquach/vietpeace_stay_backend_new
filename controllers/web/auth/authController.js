@@ -1,4 +1,6 @@
 const authService = require("../../../services/auth_service");
+const { revokeUserAccess } = require("../../../services/chat/identity");
+const { triggerOutboxDrain } = require("../../../services/chat/runtime");
 
 
 async function login(req, res) {
@@ -107,13 +109,19 @@ async function getLoggedInUser(req, res) {
 
 
 async function logout(req, res) {
-    req.session.destroy((err) => {
+    const customerId = req.session?.customer?.id || null;
+    req.session.destroy(async (err) => {
         if (err) {
             console.log("[logout] Xoa session that bai ! Error : ", err);
             return res.status(500).json({
                 success: false,
                 message: err
             });
+        }
+
+        if (customerId) {
+            await revokeUserAccess(null, customerId, "LOGOUT", { audience: "web" }).catch(() => {});
+            triggerOutboxDrain();
         }
 
         console.log("[logout] Xoa session thanh cong !");
