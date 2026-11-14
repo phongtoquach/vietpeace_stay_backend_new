@@ -205,6 +205,13 @@ async function updateAdminUser(targetUserId, { fullName, personalEmail, phoneNum
     if (!fullName || typeof fullName !== "string" || !fullName.trim()) {
         throw { statusCode: 400, errorCode: "INVALID_NAME", message: "Họ và tên không được để trống." };
     }
+    if (phoneNumber != null && typeof phoneNumber !== "string") {
+        throw { statusCode: 400, errorCode: "INVALID_PHONE", message: "Số điện thoại không hợp lệ." };
+    }
+    const normalizedPhone = (phoneNumber || "").trim().replace(/[\s().-]/g, "");
+    if (normalizedPhone && !/^\+?\d{8,15}$/.test(normalizedPhone)) {
+        throw { statusCode: 400, errorCode: "INVALID_PHONE", message: "Số điện thoại phải có 8–15 chữ số." };
+    }
 
     const pool = getDBPool();
 
@@ -212,13 +219,29 @@ async function updateAdminUser(targetUserId, { fullName, personalEmail, phoneNum
     const userRes = await pool
         .request()
         .input("id", sql.UniqueIdentifier, targetUserId)
-        .query("SELECT id, role, status, personal_email FROM dbo.users WHERE id = @id;");
+        .query("SELECT id, role, status, personal_email, phone_number FROM dbo.users WHERE id = @id;");
 
     if (userRes.recordset.length === 0) {
         throw { statusCode: 404, errorCode: "USER_NOT_FOUND", message: "Không tìm thấy người dùng." };
     }
 
     const targetUser = userRes.recordset[0];
+    const cleanPhoneNumber = phoneNumber === undefined ? targetUser.phone_number || null : normalizedPhone || null;
+    if (cleanPhoneNumber && targetUser.role === "ACCOMMODATION_MANAGER") {
+        const duplicatePhone = await pool.request()
+            .input("id", sql.UniqueIdentifier, targetUserId)
+            .input("phoneKey", sql.VarChar(20), cleanPhoneNumber.replace(/^(?:\+84|0084)/, "0"))
+            .query(`SELECT TOP 1 u.id, u.full_name FROM dbo.users u
+                CROSS APPLY (SELECT REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                    u.phone_number, ' ', ''), '-', ''), '.', ''), '(', ''), ')', ''), CHAR(9), '') AS phone) p
+                WHERE u.id <> @id AND u.role = 'ACCOMMODATION_MANAGER' AND
+                    CASE WHEN p.phone LIKE '+84%' THEN '0' + SUBSTRING(p.phone, 4, 20)
+                         WHEN p.phone LIKE '0084%' THEN '0' + SUBSTRING(p.phone, 5, 20)
+                         ELSE p.phone END = @phoneKey;`);
+        if (duplicatePhone.recordset.length) {
+            throw { statusCode: 409, errorCode: "PHONE_ALREADY_EXISTS", message: "Số điện thoại đã thuộc về Manager khác." };
+        }
+    }
     const newStatus = status !== undefined ? Number(status) : targetUser.status;
     if (![1, 2].includes(newStatus)) {
         throw { statusCode: 400, errorCode: "INVALID_STATUS", message: "Tài khoản quản trị chỉ có trạng thái hoạt động hoặc tạm khóa." };
@@ -262,7 +285,7 @@ async function updateAdminUser(targetUserId, { fullName, personalEmail, phoneNum
         .input("fullName", sql.NVarChar(255), fullName.trim())
         .input("displayName", sql.NVarChar(255), fullName.trim())
         .input("personalEmail", sql.VarChar(255), cleanPersonalEmail)
-        .input("phoneNumber", sql.VarChar(20), phoneNumber ? phoneNumber.trim() : null)
+        .input("phoneNumber", sql.VarChar(20), cleanPhoneNumber)
         .input("status", sql.TinyInt, newStatus)
         .query(`
             UPDATE dbo.users
@@ -284,7 +307,7 @@ async function updateAdminUser(targetUserId, { fullName, personalEmail, phoneNum
         id: targetUserId,
         fullName: fullName.trim(),
         personalEmail: cleanPersonalEmail,
-        phoneNumber: phoneNumber ? phoneNumber.trim() : null,
+        phoneNumber: cleanPhoneNumber,
         status: newStatus,
     };
 }

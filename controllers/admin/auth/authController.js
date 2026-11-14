@@ -4,10 +4,8 @@ const { revokeUserAccess } = require("../../../services/chat/identity");
 const { triggerOutboxDrain } = require("../../../services/chat/runtime");
 
 async function login(req, res) {
-    console.log("[authController - login] Value của req.body : ", req.body);
 
     const loginResult = await authService.login(req.body, "admin");
-    console.log("[authController - login] Ket qua hàm authService.login() : ", loginResult);
 
     if (!loginResult.success) {
         return res.json({

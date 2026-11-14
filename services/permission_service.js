@@ -60,12 +60,15 @@ async function getGrantedPermissionsForRole(role) {
  * @param {Record<string, boolean>} permissionsMap { 'accommodations.read': true, ... }
  */
 async function updateRolePermissions(role, permissionsMap) {
+    const invalid = (message) => Object.assign(new Error(message), { statusCode: 400, errorCode: "VALIDATION_ERROR" });
     if (!role || (role !== "ACCOMMODATION_MANAGER" && role !== "ADMIN")) {
-        throw new Error("Vai trò không hợp lệ để cập nhật phân quyền.");
+        throw invalid("Vai trò không hợp lệ để cập nhật phân quyền.");
     }
 
-    if (!permissionsMap || typeof permissionsMap !== "object") {
-        throw new Error("Dữ liệu phân quyền không hợp lệ.");
+    if (!permissionsMap || typeof permissionsMap !== "object" || Array.isArray(permissionsMap)
+        || !Object.keys(permissionsMap).length
+        || Object.values(permissionsMap).some(value => typeof value !== "boolean")) {
+        throw invalid("Dữ liệu phân quyền phải chứa các giá trị true hoặc false.");
     }
 
     const pool = getDBPool();
@@ -73,13 +76,18 @@ async function updateRolePermissions(role, permissionsMap) {
     await transaction.begin();
 
     try {
+        const registered = await new sql.Request(transaction).query("SELECT DISTINCT permission_key FROM dbo.role_permissions;");
+        const known = new Set(registered.recordset.map(row => row.permission_key));
+        if (Object.keys(permissionsMap).some(key => !known.has(key))) {
+            throw invalid("Quyền không tồn tại trong hệ thống.");
+        }
         for (const [permKey, isGranted] of Object.entries(permissionsMap)) {
             await new sql.Request(transaction)
                 .input("role", sql.VarChar(50), role)
                 .input("permKey", sql.VarChar(100), permKey)
                 .input("granted", sql.Bit, isGranted ? 1 : 0)
                 .query(`
-                    MERGE dbo.role_permissions AS target
+                    MERGE dbo.role_permissions WITH (HOLDLOCK) AS target
                     USING (SELECT @role AS role, @permKey AS permission_key) AS source
                     ON target.role = source.role AND target.permission_key = source.permission_key
                     WHEN MATCHED THEN

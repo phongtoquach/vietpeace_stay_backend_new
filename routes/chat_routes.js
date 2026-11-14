@@ -284,6 +284,16 @@ function createWebChatRouter() {
     }
   });
 
+  router.post("/conversations/:id/return-ai", requireWebActor, async (req, res) => {
+    try {
+      const result = await chatService.returnOwnerConversationToAi(req.chatActor, req.params.id);
+      triggerOutboxDrain();
+      return res.json({ success: true, data: result });
+    } catch (err) {
+      return handleChatError(res, err);
+    }
+  });
+
   router.post("/conversations/:id/delivered", requireWebActor, async (req, res) => {
     try {
       const result = await chatService.updateOwnerReceipt(req.chatActor, req.params.id, req.body?.sequence, {

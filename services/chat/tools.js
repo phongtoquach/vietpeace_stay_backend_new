@@ -131,6 +131,100 @@ async function resolveLocationIdByName(name) {
   return res.recordset[0] || null;
 }
 
+/** Walk up location_id hierarchy to resolve root city/province for consistent handoff grouping. */
+async function fetchRootLocation(locationId) {
+  const id = Number(locationId);
+  if (!Number.isSafeInteger(id) || id < 1) return null;
+  const pool = getDBPool();
+  const res = await pool
+    .request()
+    .input("locId", sqlObj.Int, id)
+    .query(`
+      WITH Ancestors AS (
+        SELECT id, parent_id, name, 0 AS depth
+        FROM dbo.locations
+        WHERE id = @locId AND is_active = 1
+        UNION ALL
+        SELECT p.id, p.parent_id, p.name, a.depth + 1
+        FROM dbo.locations AS p
+        INNER JOIN Ancestors AS a ON a.parent_id = p.id
+        WHERE p.is_active = 1 AND a.depth < 6
+      )
+      SELECT TOP 1 id, name
+      FROM Ancestors
+      ORDER BY depth DESC;
+    `);
+  const row = res.recordset[0];
+  return row ? { id: Number(row.id), name: row.name } : null;
+}
+
+async function fetchAccommodationBrief(accomId) {
+  const id = Number(accomId);
+  if (!Number.isSafeInteger(id) || id < 1) return null;
+  const pool = getDBPool();
+  const res = await pool
+    .request()
+    .input("accomId", sqlObj.Int, id)
+    .query(`
+      SELECT TOP 1
+        a.id AS accommodationId,
+        a.accommodation_name AS accommodationName,
+        atp.name AS accommodationTypeName,
+        a.star_rating AS starRating,
+        a.address_line AS addressLine,
+        a.location_id AS rawLocationId,
+        l.name AS locationName,
+        img.image_url AS coverImage,
+        CASE WHEN e.id IS NOT NULL AND u.status = 1 AND u.must_change_password = 0
+             THEN CAST(1 AS BIT) ELSE CAST(0 AS BIT) END AS hasActiveManager
+      FROM dbo.accommodations AS a
+      LEFT JOIN dbo.accommodation_types AS atp ON atp.id = a.accommodation_type_id
+      LEFT JOIN dbo.locations AS l ON l.id = a.location_id
+      OUTER APPLY (
+        SELECT TOP 1 image_url FROM dbo.accommodation_images ai
+        WHERE ai.accommodation_id = a.id
+        ORDER BY ai.is_cover DESC, ai.sort_order ASC, ai.id ASC
+      ) AS img
+      LEFT JOIN dbo.chat_manager_assignment_epochs AS e
+        ON e.accommodation_id = a.id AND e.revoked_at_utc IS NULL
+      LEFT JOIN dbo.users AS u ON u.id = e.user_id
+      WHERE a.id = @accomId AND a.status = 1 AND a.deleted_at IS NULL;
+    `);
+  const row = res.recordset[0];
+  if (!row) return null;
+  const rootLoc = row.rawLocationId ? await fetchRootLocation(row.rawLocationId) : null;
+  return {
+    accommodationId: Number(row.accommodationId),
+    accommodationName: row.accommodationName,
+    accommodationTypeName: row.accommodationTypeName || null,
+    starRating: row.starRating !== null && row.starRating !== undefined ? Number(row.starRating) : null,
+    addressLine: row.addressLine || null,
+    coverImage: row.coverImage || null,
+    locationId: rootLoc?.id || (row.rawLocationId ? Number(row.rawLocationId) : null),
+    locationName: rootLoc?.name || row.locationName || null,
+    hasActiveManager: Boolean(row.hasActiveManager),
+  };
+}
+
+function recordDiscussedLocation(runContext, loc) {
+  if (!runContext || !loc || !Number(loc.id)) return;
+  runContext.lastSearchLocation = { id: Number(loc.id), name: loc.name || null };
+}
+
+async function recordDiscussedAccommodationById(runContext, accomId) {
+  if (!runContext) return;
+  const brief = await fetchAccommodationBrief(accomId);
+  if (!brief) return;
+  const prev = Array.isArray(runContext.discussedAccommodations) ? runContext.discussedAccommodations : [];
+  runContext.discussedAccommodations = [
+    brief,
+    ...prev.filter((item) => Number(item.accommodationId) !== Number(brief.accommodationId)),
+  ].slice(0, 5);
+  if (brief.locationId) {
+    recordDiscussedLocation(runContext, { id: brief.locationId, name: brief.locationName });
+  }
+}
+
 async function resolveAccommodationIdByName(name) {
   if (!name || typeof name !== "string") return null;
   const pool = getDBPool();
@@ -147,7 +241,7 @@ async function resolveAccommodationIdByName(name) {
   return res.recordset[0]?.id || null;
 }
 
-async function executeSearchAccommodations(args) {
+async function executeSearchAccommodations(args, runContext) {
   const pool = getDBPool();
   let locId = Number.isSafeInteger(Number(args.locationId)) && Number(args.locationId) > 0
     ? Number(args.locationId)
@@ -167,6 +261,8 @@ async function executeSearchAccommodations(args) {
       };
     }
   }
+
+  const rootLoc = locId ? await fetchRootLocation(locId) : null;
 
   // Filter keyword direct lookup if no location filters are constraining or keyword provided
   let matchedAccomIds = null;
@@ -240,19 +336,27 @@ async function executeSearchAccommodations(args) {
         ...(args.priceTo !== undefined ? { priceTo: Number(args.priceTo) } : {}),
       });
       if ((noDatesResult?.data?.items || []).length > 0) {
+        if (rootLoc) {
+          recordDiscussedLocation(runContext, rootLoc);
+          if (runContext) runContext.hasCitySearch = true;
+        }
         return {
           status: "NO_AVAILABILITY",
-          locationId: locId,
-          locationName: resolvedLocationName || args.locationName || null,
+          locationId: rootLoc?.id || locId,
+          locationName: rootLoc?.name || resolvedLocationName || args.locationName || null,
           message: `Có cơ sở phù hợp tại khu vực này nhưng hiện hết phòng cho ngày ${args.checkinDate} – ${args.checkoutDate}.`,
           items: [],
         };
       }
     }
+    if (rootLoc) {
+      recordDiscussedLocation(runContext, rootLoc);
+      if (runContext) runContext.hasCitySearch = true;
+    }
     return {
       status: "NO_MATCH_FILTERS",
-      locationId: locId,
-      locationName: resolvedLocationName || args.locationName || null,
+      locationId: rootLoc?.id || locId,
+      locationName: rootLoc?.name || resolvedLocationName || args.locationName || null,
       message: "Có cơ sở tại điểm đến này nhưng không khớp điều kiện lọc giá/hạng sao hiện tại.",
       items: [],
     };
@@ -272,6 +376,14 @@ async function executeSearchAccommodations(args) {
     email: a.email || null,
     detailUrl: `/accommodation-detail?accommodationId=${a.id}`,
   }));
+
+  if (rootLoc && compact.length > 0) {
+    recordDiscussedLocation(runContext, rootLoc);
+    if (runContext) runContext.hasCitySearch = true;
+  }
+  if (args.keyword && compact.length === 1) {
+    await recordDiscussedAccommodationById(runContext, compact[0].accommodationId);
+  }
 
   return {
     status: compact.length > 0 ? "FOUND" : "NO_MATCH_FILTERS",
@@ -432,13 +544,23 @@ async function executeTool(name, args = {}, runContext) {
 
   switch (name) {
     case "search_accommodations":
-      return executeSearchAccommodations(args);
+      return executeSearchAccommodations(args, runContext);
 
-    case "get_accommodation_info":
-      return executeGetAccommodationInfo(args);
+    case "get_accommodation_info": {
+      const result = await executeGetAccommodationInfo(args);
+      if (result?.status === "FOUND" && result.accommodation?.id) {
+        await recordDiscussedAccommodationById(runContext, result.accommodation.id);
+      }
+      return result;
+    }
 
-    case "get_accommodation_room_types":
-      return executeGetAccommodationRoomTypes(args);
+    case "get_accommodation_room_types": {
+      const result = await executeGetAccommodationRoomTypes(args);
+      if (result?.status === "FOUND" && result.accommodationId) {
+        await recordDiscussedAccommodationById(runContext, result.accommodationId);
+      }
+      return result;
+    }
 
     case "get_room_recommendations": {
       const result = await recommendRoomsAndQuote({
@@ -450,6 +572,10 @@ async function executeTool(name, args = {}, runContext) {
         rooms: args.rooms,
         preferredRoomTypeId: args.preferredRoomTypeId,
       });
+      const quotedAccomId = result?.accommodation?.id || (result?.status !== "NOT_FOUND" ? Number(args.accommodationId) : null);
+      if (Number.isSafeInteger(quotedAccomId) && quotedAccomId > 0) {
+        await recordDiscussedAccommodationById(runContext, quotedAccomId);
+      }
       if (result.status === "READY" && result.options?.length > 0) {
         runContext.cardsToEmit.push({
           messageType: "QUOTE_CARD",

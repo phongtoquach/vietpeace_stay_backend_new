@@ -4,9 +4,12 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node --test test/chat.unified.test.js",
+    "test": "node test/chat.integration.runner.js",
     "test:handover": "node --test test/manager_handover.test.js",
-    "test:chat": "node --test test/chat.unified.test.js",
+    "test:chat": "node test/chat.integration.runner.js",
+    "test:chat:unit": "node --test test/chat.ai.unit.test.js",
+    "test:chat:reports": "node test/chat.reports.runner.js",
+    "test:modules": "node test/modules.integration.runner.js",
     "migrate:chat": "node scripts/migrate_chat_unified.js",
     "start": "node server.js",
     "dev": "node --watch server.js"

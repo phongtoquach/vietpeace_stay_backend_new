@@ -756,6 +756,7 @@ async function loadAndComputeFinancialRows(filters = {}, actor = {}) {
         b.room_discount_total,
         b.discount_amount,
         b.tax_amount,
+        b.total_amount AS booking_total_amount,
         p.status AS payment_status,
         p.amount AS payment_amount,
         p.refunded_amount,
@@ -850,8 +851,8 @@ async function loadAndComputeFinancialRows(filters = {}, actor = {}) {
     const refunded = toNumber(row.refunded_amount);
     const collected = amount - refunded;
     const taxShare =
-      row.payment_status !== "REFUNDED" && amount > 0
-        ? roundVnd(toNumber(row.tax_amount) * (collected / amount))
+      row.payment_status !== "REFUNDED" && toNumber(row.booking_total_amount) > 0
+        ? roundVnd(toNumber(row.tax_amount) * (collected / toNumber(row.booking_total_amount)))
         : 0;
     const netPreVat = collected - taxShare;
 
@@ -1289,7 +1290,7 @@ async function getAccommodationFinancialDetail(accommodationId, filters = {}, ac
 
 function validateNonNegativeNumber(val, fieldLabel) {
   const num = Number(val);
-  if (!Number.isFinite(num) || num < 0) {
+  if (!["number", "string"].includes(typeof val) || String(val).trim() === "" || !Number.isFinite(num) || num < 0 || num > 9999999999999999) {
     throw new FinancialReportError(
       400,
       ERROR_CODES.VALIDATION_ERROR,
@@ -1297,6 +1298,22 @@ function validateNonNegativeNumber(val, fieldLabel) {
     );
   }
   return num;
+}
+
+function validateBoolean(value, fieldLabel, fallback = false) {
+  if (value === undefined) return fallback;
+  if (typeof value !== "boolean") {
+    throw new FinancialReportError(400, ERROR_CODES.VALIDATION_ERROR, `${fieldLabel} phải là true hoặc false.`);
+  }
+  return value;
+}
+
+function validateHeadcount(value) {
+  const count = validateNonNegativeNumber(value, "Số nhân sự");
+  if (!Number.isInteger(count) || count > 2147483647) {
+    throw new FinancialReportError(400, ERROR_CODES.VALIDATION_ERROR, "Số nhân sự phải là số nguyên hợp lệ.");
+  }
+  return count;
 }
 
 async function upsertAccommodationMonthlyLedger(accommodationId, payload = {}, adminUser = {}) {
@@ -1334,8 +1351,8 @@ async function upsertAccommodationMonthlyLedger(accommodationId, payload = {}, a
     manager_salary_cost: validateNonNegativeNumber(payload.manager_salary_cost ?? 0, "Lương Manager"),
     staff_payroll_cost: validateNonNegativeNumber(payload.staff_payroll_cost ?? 0, "Quỹ lương nhân viên"),
     other_operating_cost: validateNonNegativeNumber(payload.other_operating_cost ?? 0, "Chi phí vận hành khác"),
-    staff_headcount_snapshot: Math.trunc(validateNonNegativeNumber(payload.staff_headcount_snapshot ?? 8, "Số nhân sự")),
-    is_locked: payload.is_locked ? 1 : 0,
+    staff_headcount_snapshot: validateHeadcount(payload.staff_headcount_snapshot ?? 8),
+    is_locked: validateBoolean(payload.is_locked, "Khóa sổ") ? 1 : 0,
     note: payload.note ? String(payload.note).slice(0, 1000) : null,
   };
 
@@ -1360,7 +1377,7 @@ async function upsertAccommodationMonthlyLedger(accommodationId, payload = {}, a
     .input("updated_by_user_id", sql.UniqueIdentifier, adminUser.id || null);
 
   const upsertRes = await req.query(`
-    MERGE dbo.accommodation_monthly_ledgers AS target
+    MERGE dbo.accommodation_monthly_ledgers WITH (HOLDLOCK) AS target
     USING (SELECT @accommodation_id AS accommodation_id, @period_year AS period_year, @period_month AS period_month) AS src
       ON target.accommodation_id = src.accommodation_id
      AND target.period_year = src.period_year
@@ -1420,7 +1437,7 @@ async function updateAccommodationOperatingProfile(accommodationId, payload = {}
     throw new FinancialReportError(404, ERROR_CODES.NOT_FOUND, "Không tìm thấy cơ sở lưu trú.");
   }
 
-  const staffHeadcount = Math.trunc(validateNonNegativeNumber(payload.staff_headcount ?? 8, "Số lượng nhân viên"));
+  const staffHeadcount = validateHeadcount(payload.staff_headcount ?? 8);
   const staffAvgSalary = validateNonNegativeNumber(payload.staff_avg_salary ?? 7500000, "Lương bình quân nhân viên");
   const staffMonthlyPayroll =
     payload.staff_monthly_payroll !== undefined && payload.staff_monthly_payroll !== null
@@ -1457,7 +1474,7 @@ async function updateAccommodationOperatingProfile(accommodationId, payload = {}
     .input("updated_by_user_id", sql.UniqueIdentifier, adminUser.id || null);
 
   const res = await req.query(`
-    MERGE dbo.accommodation_operating_profiles AS target
+    MERGE dbo.accommodation_operating_profiles WITH (HOLDLOCK) AS target
     USING (SELECT @accommodation_id AS accommodation_id) AS src
       ON target.accommodation_id = src.accommodation_id
     WHEN MATCHED THEN
@@ -1689,9 +1706,14 @@ async function approveAndSaveBonusSettlements(payload = {}, adminUser = {}) {
     throw new FinancialReportError(400, ERROR_CODES.VALIDATION_ERROR, "Trạng thái duyệt chỉ nhận DRAFT, APPROVED hoặc PAID.");
   }
 
-  const sendEmails = Boolean(payload.sendEmails);
+  const sendEmails = validateBoolean(payload.sendEmails, "Gửi email");
   const adminNote = payload.adminNote ? String(payload.adminNote).slice(0, 1000) : null;
-  const targetIds = Array.isArray(payload.accommodationIds) && payload.accommodationIds.length
+  if (payload.accommodationIds !== undefined && (!Array.isArray(payload.accommodationIds)
+      || !payload.accommodationIds.length
+      || payload.accommodationIds.some(id => !["string", "number"].includes(typeof id) || !Number.isInteger(Number(id)) || Number(id) <= 0))) {
+    throw new FinancialReportError(400, ERROR_CODES.VALIDATION_ERROR, "Danh sách cơ sở phê duyệt không hợp lệ.");
+  }
+  const targetIds = Array.isArray(payload.accommodationIds)
     ? new Set(payload.accommodationIds.map(Number))
     : null;
 
@@ -1715,6 +1737,9 @@ async function approveAndSaveBonusSettlements(payload = {}, adminUser = {}) {
 
   if (!itemsToSave.length) {
     throw new FinancialReportError(400, ERROR_CODES.VALIDATION_ERROR, "Không có cơ sở nào khớp để phê duyệt.");
+  }
+  if (targetIds && itemsToSave.length !== targetIds.size) {
+    throw new FinancialReportError(400, ERROR_CODES.VALIDATION_ERROR, "Một số cơ sở phê duyệt không tồn tại hoặc nằm ngoài phạm vi truy cập.");
   }
 
   let savedCount = 0;
@@ -1796,7 +1821,7 @@ async function approveAndSaveBonusSettlements(payload = {}, adminUser = {}) {
       .input("approved_at", sql.DateTime2, status === "APPROVED" || status === "PAID" ? new Date() : null);
 
     await req.query(`
-      MERGE dbo.accommodation_bonus_settlements AS target
+      MERGE dbo.accommodation_bonus_settlements WITH (HOLDLOCK) AS target
       USING (
         SELECT @settlement_type AS settlement_type,
                @period_year AS period_year,
@@ -1967,8 +1992,11 @@ async function getPaymentReconciliationLedger(filters = {}, actor = {}) {
       : null;
   const search = String(filters.search || "").trim();
 
-  const page = Math.max(1, Number(filters.page) || 1);
-  const pageSize = Math.min(100, Math.max(1, Number(filters.pageSize) || 20));
+  const page = Math.max(1, Math.trunc(Number(filters.page)) || 1);
+  const pageSize = Math.min(100, Math.max(1, Math.trunc(Number(filters.pageSize)) || 20));
+  if (!Number.isSafeInteger(page) || !Number.isSafeInteger(pageSize) || !Number.isSafeInteger((page - 1) * pageSize)) {
+    throw new FinancialReportError(400, ERROR_CODES.VALIDATION_ERROR, "Phân trang không hợp lệ.");
+  }
   const offset = (page - 1) * pageSize;
 
   const buildReq = (withPagination = false) => {
@@ -2013,10 +2041,10 @@ async function getPaymentReconciliationLedger(filters = {}, actor = {}) {
         p.provider_transaction_id,
         p.amount,
         p.refunded_amount,
-        (p.amount - p.refunded_amount) AS net_cash_collected,
+        CASE WHEN p.status IN ('SUCCESS', 'PARTIALLY_REFUNDED', 'REFUNDED') THEN (p.amount - p.refunded_amount) ELSE 0 END AS net_cash_collected,
         CASE
-          WHEN p.status IN ('SUCCESS', 'PARTIALLY_REFUNDED') AND p.amount > 0
-          THEN ROUND(b.tax_amount * ((p.amount - p.refunded_amount) / p.amount), 0)
+          WHEN p.status IN ('SUCCESS', 'PARTIALLY_REFUNDED') AND b.total_amount > 0
+          THEN ROUND(b.tax_amount * ((p.amount - p.refunded_amount) / b.total_amount), 0)
           ELSE 0
         END AS booking_tax_collected,
         p.status AS payment_status,
@@ -2049,7 +2077,7 @@ async function getPaymentReconciliationLedger(filters = {}, actor = {}) {
         ISNULL(SUM(CASE WHEN p.status IN ('SUCCESS', 'PARTIALLY_REFUNDED', 'REFUNDED') AND p.paid_at >= @periodStart AND p.paid_at < @periodEnd THEN p.amount ELSE 0 END), 0) AS total_gross_billed,
         ISNULL(SUM(CASE WHEN p.status IN ('SUCCESS', 'PARTIALLY_REFUNDED', 'REFUNDED') AND p.paid_at >= @periodStart AND p.paid_at < @periodEnd THEN p.refunded_amount ELSE 0 END), 0) AS total_refunded_amount,
         ISNULL(SUM(CASE WHEN p.status IN ('SUCCESS', 'PARTIALLY_REFUNDED', 'REFUNDED') AND p.paid_at >= @periodStart AND p.paid_at < @periodEnd THEN (p.amount - p.refunded_amount) ELSE 0 END), 0) AS total_net_collected_cash,
-        ISNULL(SUM(CASE WHEN p.status IN ('SUCCESS', 'PARTIALLY_REFUNDED') AND p.paid_at >= @periodStart AND p.paid_at < @periodEnd AND p.amount > 0 THEN ROUND(b.tax_amount * ((p.amount - p.refunded_amount) / p.amount), 0) ELSE 0 END), 0) AS total_vat_collected,
+        ISNULL(SUM(CASE WHEN p.status IN ('SUCCESS', 'PARTIALLY_REFUNDED') AND p.paid_at >= @periodStart AND p.paid_at < @periodEnd AND b.total_amount > 0 THEN ROUND(b.tax_amount * ((p.amount - p.refunded_amount) / b.total_amount), 0) ELSE 0 END), 0) AS total_vat_collected,
         ISNULL(SUM(CASE WHEN p.status = 'REFUND_PROCESSING' THEN p.amount ELSE 0 END), 0) AS pending_refund_amount,
         SUM(CASE WHEN p.status = 'REFUND_PROCESSING' THEN 1 ELSE 0 END) AS pending_refund_count
       FROM dbo.payments p

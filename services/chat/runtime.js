@@ -29,7 +29,8 @@ function getRuntime() {
 
   function emitToConversation(conversationId, eventName, payload) {
     const cid = Number(conversationId);
-    nsp.to(`conversation:${cid}:public`).emit(eventName, payload);
+    // AI may stream private booking data before the final message visibility is known.
+    nsp.to(`conversation:${cid}:owner`).emit(eventName, payload);
   }
 
   return {
@@ -114,11 +115,15 @@ async function dispatchOutboxJob(job) {
     const cid = Number(payload.conversationId || job.conversationId);
     if (!cid) return;
 
-    const visibility = payload.visibility || payload.message?.visibility || "PUBLIC";
+    // Also protect completion jobs queued before visibility was added to AI envelopes.
+    const visibility = job.eventName?.startsWith("ai:")
+      ? "OWNER_ONLY"
+      : payload.visibility || payload.message?.visibility || "PUBLIC";
 
     if (visibility === "OWNER_ONLY") {
-      nsp.to(`conversation:${cid}:owner`).emit(job.eventName, payload);
-      if (payload.ownerKey) nsp.to(actorRoom(payload.ownerKey)).emit(job.eventName, payload);
+      let recipients = nsp.to(`conversation:${cid}:owner`);
+      if (payload.ownerKey) recipients = recipients.to(actorRoom(payload.ownerKey));
+      recipients.emit(job.eventName, payload);
       return;
     }
 
@@ -128,19 +133,21 @@ async function dispatchOutboxJob(job) {
     }
 
     // PUBLIC events: deliver to joined conversation room + owner room + target/assigned manager room + admin supervisors
-    nsp.to(`conversation:${cid}:public`).emit(job.eventName, payload);
+    // A socket can belong to several of these rooms. Emit once to their union.
+    let recipients = nsp.to(`conversation:${cid}:public`);
     if (payload.ownerKey) {
-      nsp.to(actorRoom(payload.ownerKey)).emit(job.eventName, payload);
+      recipients = recipients.to(actorRoom(payload.ownerKey));
     }
     if (payload.assignedUserId) {
-      nsp.to(actorRoom(`user:${String(payload.assignedUserId).toLowerCase()}`)).emit(job.eventName, payload);
+      recipients = recipients.to(actorRoom(`user:${String(payload.assignedUserId).toLowerCase()}`));
     }
     if (payload.targetManagerUserId) {
-      nsp.to(actorRoom(`user:${String(payload.targetManagerUserId).toLowerCase()}`)).emit(job.eventName, payload);
+      recipients = recipients.to(actorRoom(`user:${String(payload.targetManagerUserId).toLowerCase()}`));
     }
     if (["message:created", "conversation:updated"].includes(job.eventName)) {
-      nsp.to("role:ADMIN").emit(job.eventName, payload);
+      recipients = recipients.to("role:ADMIN");
     }
+    recipients.emit(job.eventName, payload);
   }
 }
 

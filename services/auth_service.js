@@ -4,6 +4,7 @@ const bcrypt = require("bcryptjs");
 
 const { getDBPool } = require("../configs/database");
 const mailService = require("./mail_service");
+const { invalidateActorAuthCache } = require("./chat/identity");
 
 const EMAIL_REGEX =
     /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
@@ -354,6 +355,75 @@ async function issueCustomerVerificationToken(transaction, userId, email) {
     return rawToken;
 }
 
+function validateCustomerProfileFields(body, { preserveMissingDisplayName = false } = {}) {
+    const errors = {};
+
+    const rawFullName = body.fullName ?? body.full_name;
+    const fullName = typeof rawFullName === "string" ? rawFullName.trim() : "";
+
+    const hasDisplayNameKey =
+        Object.prototype.hasOwnProperty.call(body, "displayName") ||
+        Object.prototype.hasOwnProperty.call(body, "display_name");
+    const rawDisplayName = body.displayName ?? body.display_name;
+
+    let displayName = fullName;
+    if (rawDisplayName !== undefined && rawDisplayName !== null) {
+        if (typeof rawDisplayName !== "string") {
+            errors.displayName = "Tên hiển thị phải là chuỗi.";
+        } else {
+            const trimmedDisplayName = rawDisplayName.trim();
+            displayName = trimmedDisplayName || fullName;
+        }
+    }
+
+    const rawPhone = body.phone ?? body.phoneNumber ?? body.phone_number;
+    let phoneNumber = "";
+
+    if (!fullName) {
+        errors.fullName = "Vui lòng nhập họ và tên.";
+    } else if (fullName.length > 255) {
+        errors.fullName = "Họ và tên không được vượt quá 255 ký tự.";
+    }
+
+    if (!errors.displayName && displayName.length > 255) {
+        errors.displayName = "Tên hiển thị không được vượt quá 255 ký tự.";
+    }
+
+    if (rawPhone === undefined || rawPhone === null || (typeof rawPhone === "string" && !rawPhone.trim())) {
+        errors.phone = "Vui lòng nhập số điện thoại.";
+    } else if (typeof rawPhone !== "string") {
+        errors.phone = "Số điện thoại phải là chuỗi.";
+    } else {
+        phoneNumber = rawPhone.trim();
+        const digitCount = phoneNumber.replace(/\D/g, "").length;
+        if (!PHONE_REGEX.test(phoneNumber) || digitCount < 9 || digitCount > 15) {
+            errors.phone = "Số điện thoại phải gồm 9–15 chữ số hợp lệ.";
+        }
+    }
+
+    return {
+        fullName,
+        displayName,
+        hasDisplayName: hasDisplayNameKey && !preserveMissingDisplayName ? true : hasDisplayNameKey,
+        phoneNumber,
+        errors,
+    };
+}
+
+function validatePasswordField(rawPassword, fieldName = "password", label = "Mật khẩu") {
+    if (!rawPassword || typeof rawPassword !== "string") {
+        return `Vui lòng nhập ${label.toLowerCase()}.`;
+    }
+    if (rawPassword.length < 8) {
+        return `${label} phải có ít nhất 8 ký tự.`;
+    }
+    // bcrypt chỉ xử lý tối đa 72 byte password.
+    if (Buffer.byteLength(rawPassword, "utf8") > 72) {
+        return `${label} không được vượt quá 72 byte UTF-8.`;
+    }
+    return null;
+}
+
 /**
  * body:
  * {
@@ -376,40 +446,11 @@ async function register(body) {
     const { email: rawEmail, password, errors } = validateCredentials(body);
     const email = rawEmail.toLowerCase();
 
-    const rawFullName = body.fullName ?? body.full_name;
-    const fullName = typeof rawFullName === "string" ? rawFullName.trim() : "";
-
-    const rawDisplayName = body.displayName ?? body.display_name;
-    const displayName = typeof rawDisplayName === "string" && rawDisplayName.trim()
-        ? rawDisplayName.trim()
-        : fullName;
-
-    const rawPhone = body.phone ?? body.phoneNumber ?? body.phone_number;
-    let phoneNumber = "";
+    const profileValidation = validateCustomerProfileFields(body);
+    const { fullName, displayName, phoneNumber, errors: profileErrors } = profileValidation;
+    Object.assign(errors, profileErrors);
 
     const rawConfirmPassword = body.confirmPassword ?? body.confirm_password;
-
-    if (!fullName) {
-        errors.fullName = "Vui lòng nhập họ và tên.";
-    } else if (fullName.length > 255) {
-        errors.fullName = "Họ và tên không được vượt quá 255 ký tự.";
-    }
-
-    if (displayName.length > 255) {
-        errors.displayName = "Tên hiển thị không được vượt quá 255 ký tự.";
-    }
-
-    if (rawPhone === undefined || rawPhone === null || (typeof rawPhone === "string" && !rawPhone.trim())) {
-        errors.phone = "Vui lòng nhập số điện thoại.";
-    } else if (typeof rawPhone !== "string") {
-        errors.phone = "Số điện thoại phải là chuỗi.";
-    } else {
-        phoneNumber = rawPhone.trim();
-        const digitCount = phoneNumber.replace(/\D/g, "").length;
-        if (!PHONE_REGEX.test(phoneNumber) || digitCount < 9 || digitCount > 15) {
-            errors.phone = "Số điện thoại phải gồm 9–15 chữ số hợp lệ.";
-        }
-    }
 
     // bcrypt chỉ xử lý tối đa 72 byte password.
     if (!errors.password && Buffer.byteLength(password, "utf8") > 72) {
@@ -936,7 +977,6 @@ async function getCustomerDataById(userId) {
     }
 
     const userRow = result.recordset[0];
-    console.log("[auth_service - getCustomerDataById()] Data cua user tim duoc : ", userRow);
 
     // chi chap nhan user co role la CUSTOMER
     if (userRow.role !== "CUSTOMER") {
@@ -955,6 +995,257 @@ async function getCustomerDataById(userId) {
 }
 
 
+function mapCustomerProfile(userRow) {
+    return {
+        id: userRow.id,
+        userId: userRow.id,
+        email: userRow.email,
+        fullName: userRow.full_name,
+        displayName: userRow.display_name || userRow.full_name,
+        phoneNumber: userRow.phone_number || "",
+        avatarUrl: userRow.avatar_url || null,
+        role: userRow.role,
+        status: userRow.status,
+        emailVerifiedAt: userRow.email_verified_at || null,
+        createdAt: userRow.created_at || null,
+        updatedAt: userRow.updated_at || null,
+    };
+}
+
+async function loadActiveCustomerRow(userId, { includePasswordHash = false } = {}) {
+    if (!userId) {
+        return failure("NO_USER_SESSION", "Vui lòng đăng nhập vào website.");
+    }
+
+    const pool = getDBPool();
+    const passwordCol = includePasswordHash ? ", u.password_hash" : "";
+    const result = await pool
+        .request()
+        .input("id", sql.UniqueIdentifier, userId)
+        .query(`
+            SELECT
+                u.id,
+                u.email,
+                u.full_name,
+                u.display_name,
+                u.phone_number,
+                u.avatar_url,
+                u.role,
+                u.status,
+                u.email_verified_at,
+                u.created_at,
+                u.updated_at${passwordCol}
+            FROM dbo.users u
+            WHERE u.id = @id;
+        `);
+
+    if (result.recordset.length === 0) {
+        return failure("USER_NOT_EXISTED", "User không tồn tại trong hệ thống.");
+    }
+
+    const userRow = result.recordset[0];
+    if (userRow.role !== "CUSTOMER") {
+        return failure(
+            "ACCOUNT_IS_NOT_CUSTOMER",
+            "Tài khoản này không phải là tài khoản Customer !"
+        );
+    }
+
+    if (userRow.status !== 1) {
+        return failure(
+            "ACCOUNT_INACTIVE",
+            "Tài khoản chưa được kích hoạt hoặc đã bị khóa."
+        );
+    }
+
+    return {
+        success: true,
+        data: { userRow },
+    };
+}
+
+async function getCustomerProfileById(userId) {
+    const loaded = await loadActiveCustomerRow(userId);
+    if (!loaded.success) {
+        return loaded;
+    }
+
+    return {
+        success: true,
+        data: {
+            customer: mapCustomerProfile(loaded.data.userRow),
+        },
+    };
+}
+
+async function updateCustomerProfile(userId, body) {
+    if (!userId) {
+        return failure("NO_USER_SESSION", "Vui lòng đăng nhập vào website.");
+    }
+
+    if (!isValidBody(body)) {
+        return failure("DATA_INVALID", "Request body không hợp lệ.");
+    }
+
+    const { fullName, displayName, hasDisplayName, phoneNumber, errors } =
+        validateCustomerProfileFields(body, { preserveMissingDisplayName: true });
+
+    if (Object.keys(errors).length > 0) {
+        return failure(
+            "DATA_INVALID",
+            "Vui lòng kiểm tra lại thông tin hồ sơ.",
+            errors
+        );
+    }
+
+    const loaded = await loadActiveCustomerRow(userId);
+    if (!loaded.success) {
+        return loaded;
+    }
+
+    const existing = loaded.data.userRow;
+    const finalDisplayName = hasDisplayName
+        ? displayName
+        : (!existing.display_name || existing.display_name === existing.full_name
+            ? fullName
+            : existing.display_name);
+
+    const pool = getDBPool();
+    const updatedResult = await pool
+        .request()
+        .input("id", sql.UniqueIdentifier, userId)
+        .input("fullName", sql.NVarChar(255), fullName)
+        .input("displayName", sql.NVarChar(255), finalDisplayName)
+        .input("phoneNumber", sql.VarChar(20), phoneNumber)
+        .query(`
+            UPDATE dbo.users
+            SET full_name = @fullName,
+                display_name = @displayName,
+                phone_number = @phoneNumber,
+                updated_at = SYSDATETIME()
+            OUTPUT
+                INSERTED.id,
+                INSERTED.email,
+                INSERTED.full_name,
+                INSERTED.display_name,
+                INSERTED.phone_number,
+                INSERTED.avatar_url,
+                INSERTED.role,
+                INSERTED.status,
+                INSERTED.email_verified_at,
+                INSERTED.created_at,
+                INSERTED.updated_at
+            WHERE id = @id
+              AND role = 'CUSTOMER'
+              AND status = 1;
+        `);
+
+    if (updatedResult.recordset.length === 0) {
+        return failure("ACCOUNT_INACTIVE", "Không thể cập nhật thông tin tài khoản lúc này.");
+    }
+
+    invalidateActorAuthCache(userId);
+
+    return {
+        success: true,
+        message: "Cập nhật thông tin tài khoản thành công.",
+        data: {
+            customer: mapCustomerProfile(updatedResult.recordset[0]),
+        },
+    };
+}
+
+async function changeCustomerPassword(userId, body) {
+    if (!userId) {
+        return failure("NO_USER_SESSION", "Vui lòng đăng nhập vào website.");
+    }
+
+    if (!isValidBody(body)) {
+        return failure("DATA_INVALID", "Request body không hợp lệ.");
+    }
+
+    // Không trim password vì khoảng trắng có thể thuộc password.
+    const currentPassword = body.currentPassword ?? body.oldPassword;
+    const newPassword = body.newPassword ?? body.password;
+    const confirmPassword = body.confirmPassword ?? body.confirmNewPassword ?? body.confirm_password;
+
+    const errors = {};
+    if (!currentPassword || typeof currentPassword !== "string") {
+        errors.currentPassword = "Vui lòng nhập mật khẩu hiện tại.";
+    }
+
+    const newPasswordError = validatePasswordField(newPassword, "newPassword", "Mật khẩu mới");
+    if (newPasswordError) {
+        errors.newPassword = newPasswordError;
+    }
+
+    if (confirmPassword !== undefined) {
+        if (typeof confirmPassword !== "string" || confirmPassword !== newPassword) {
+            errors.confirmPassword = "Mật khẩu xác nhận chưa khớp.";
+        }
+    }
+
+    if (!errors.currentPassword && !errors.newPassword && currentPassword === newPassword) {
+        errors.newPassword = "Mật khẩu mới phải khác mật khẩu hiện tại.";
+    }
+
+    if (Object.keys(errors).length > 0) {
+        return failure(
+            "DATA_INVALID",
+            "Vui lòng kiểm tra lại thông tin đổi mật khẩu.",
+            errors
+        );
+    }
+
+    const loaded = await loadActiveCustomerRow(userId, { includePasswordHash: true });
+    if (!loaded.success) {
+        return loaded;
+    }
+
+    const passwordMatches = await bcrypt.compare(currentPassword, loaded.data.userRow.password_hash);
+    if (!passwordMatches) {
+        return failure(
+            "WRONG_CURRENT_PASSWORD",
+            "Mật khẩu hiện tại không chính xác.",
+            {
+                currentPassword: "Mật khẩu hiện tại không chính xác.",
+            }
+        );
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, 12);
+    const pool = getDBPool();
+    const updateResult = await pool
+        .request()
+        .input("id", sql.UniqueIdentifier, userId)
+        .input("passwordHash", sql.VarChar(255), passwordHash)
+        .query(`
+            UPDATE dbo.users
+            SET password_hash = @passwordHash,
+                must_change_password = 0,
+                password_change_at = SYSDATETIME(),
+                updated_at = SYSDATETIME()
+            WHERE id = @id
+              AND role = 'CUSTOMER'
+              AND status = 1;
+        `);
+
+    if (!updateResult.rowsAffected || updateResult.rowsAffected[0] === 0) {
+        return failure("ACCOUNT_INACTIVE", "Không thể đổi mật khẩu lúc này.");
+    }
+
+    invalidateActorAuthCache(userId);
+
+    return {
+        success: true,
+        message: "Đổi mật khẩu thành công.",
+        data: {
+            userId,
+        },
+    };
+}
+
+
 module.exports = {
     login,
     register,
@@ -964,5 +1255,8 @@ module.exports = {
     getAdminUserById,
     changeInitialPassword,
     isAdminPanelRole,
-    getCustomerDataById
+    getCustomerDataById,
+    getCustomerProfileById,
+    updateCustomerProfile,
+    changeCustomerPassword
 };

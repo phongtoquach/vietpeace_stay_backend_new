@@ -9,6 +9,7 @@ const {
   recordChatEvent,
 } = require("./db");
 const { hasPermission } = require("./identity");
+const { reportInteger, reportPagination, reportText } = require("./report_validation");
 
 /**
  * Customer rates a specific handoff session 1-5 stars after at least one public manager reply.
@@ -119,6 +120,19 @@ async function submitHandoffRating(actor, handoffId, { rating, comment = null })
       },
     });
 
+    await enqueueOutbox(tx, {
+      kind: "SOCKET_EVENT",
+      conversationId: Number(h.conversationId),
+      eventName: "conversation:updated",
+      payload: {
+        conversationId: Number(h.conversationId),
+        ownerKey: actor.actorKey,
+        hasRatedHandoff: true,
+        pendingRatingHandoffId: null,
+        pendingRatingManagerName: null,
+      },
+    });
+
     if (stars <= 3) {
       await enqueueOutbox(tx, {
         kind: "SOCKET_EVENT",
@@ -184,21 +198,30 @@ function assertAdminReportsAccess(actor) {
 async function listAdminRatings(actor, { status = "ALL", limit = 50, offset = 0 } = {}) {
   assertAdminReportsAccess(actor);
   const pool = getDBPool();
-  const cleanStatus = String(status || "ALL").toUpperCase();
+  const cleanStatus = String(status || "ALL").trim().toUpperCase();
+  if (!["ALL", "ACTIVE", "PENDING_REVIEW", "CONFIRMED_VIOLATION", "DISMISSED", "NONE"].includes(cleanStatus)) {
+    throw chatError(400, "INVALID_REVIEW_STATUS", "Bộ lọc đánh giá không hợp lệ.");
+  }
+  const page = reportPagination({ limit, offset });
+  const isActiveOnly = cleanStatus === "ACTIVE";
   const filterStatus = ["PENDING_REVIEW", "CONFIRMED_VIOLATION", "DISMISSED", "NONE"].includes(cleanStatus)
     ? cleanStatus
     : null;
 
   const res = await pool
     .request()
+    .input("activeOnly", sqlObj.Bit, isActiveOnly ? 1 : 0)
     .input("status", sqlObj.VarChar(32), filterStatus)
-    .input("limit", sqlObj.Int, Math.min(Math.max(Number(limit) || 50, 1), 100))
-    .input("offset", sqlObj.Int, Math.max(Number(offset) || 0, 0))
+    .input("limit", sqlObj.Int, page.limit)
+    .input("offset", sqlObj.Int, page.offset)
     .query(`
       SELECT
         r.id,
         r.conversation_id AS conversationId,
         r.handoff_id AS handoffId,
+        h.requested_at AS handoffRequestedAt,
+        h.claimed_at AS handoffClaimedAt,
+        h.ended_at AS handoffClosedAt,
         r.accommodation_id AS accommodationId,
         a.accommodation_name AS accommodationName,
         r.customer_user_id AS customerUserId,
@@ -219,6 +242,7 @@ async function listAdminRatings(actor, { status = "ALL", limit = 50, offset = 0 
         w.error_message AS latestWarningError
       FROM dbo.chat_conversation_ratings AS r
       INNER JOIN dbo.accommodations AS a ON a.id = r.accommodation_id
+      LEFT JOIN dbo.chat_handoff_sessions AS h ON h.id = r.handoff_id
       LEFT JOIN dbo.users AS cu ON cu.id = r.customer_user_id
       LEFT JOIN dbo.users AS mu ON mu.id = r.manager_user_id
       OUTER APPLY (
@@ -227,8 +251,21 @@ async function listAdminRatings(actor, { status = "ALL", limit = 50, offset = 0 
         WHERE wa.rating_id = r.id
         ORDER BY wa.id DESC
       ) AS w
-      WHERE (@status IS NULL OR r.admin_review_status = @status)
-      ORDER BY CASE WHEN r.admin_review_status = 'PENDING_REVIEW' THEN 0 ELSE 1 END, r.created_at DESC
+      WHERE (@status = 'NONE' OR r.rating <= 3)
+        AND (
+          (
+            @activeOnly = 1
+            AND (
+              r.admin_review_status = 'PENDING_REVIEW'
+              OR (
+                r.admin_review_status = 'CONFIRMED_VIOLATION'
+                AND (w.status IS NULL OR w.status <> 'SENT')
+              )
+            )
+          )
+          OR (@activeOnly = 0 AND (@status IS NULL OR r.admin_review_status = @status))
+        )
+      ORDER BY CASE WHEN r.admin_review_status = 'PENDING_REVIEW' THEN 0 ELSE 1 END, r.created_at DESC, r.id DESC
       OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY;
     `);
 
@@ -239,6 +276,9 @@ async function listAdminRatings(actor, { status = "ALL", limit = 50, offset = 0 
     handoffId: Number(r.handoffId),
     accommodationId: Number(r.accommodationId),
     rating: Number(r.rating),
+    handoffRequestedAt: r.handoffRequestedAt ? new Date(r.handoffRequestedAt).toISOString() : null,
+    handoffClaimedAt: r.handoffClaimedAt ? new Date(r.handoffClaimedAt).toISOString() : null,
+    handoffClosedAt: r.handoffClosedAt ? new Date(r.handoffClosedAt).toISOString() : null,
     latestWarningId: r.latestWarningId ? Number(r.latestWarningId) : null,
     reviewedAt: r.reviewedAt ? new Date(r.reviewedAt).toISOString() : null,
     latestWarningSentAt: r.latestWarningSentAt ? new Date(r.latestWarningSentAt).toISOString() : null,
@@ -256,109 +296,128 @@ async function reviewAdminRating(actor, ratingId, { decision, reviewNote = null 
     throw chatError(400, "INVALID_DECISION", "Trạng thái duyệt phải là CONFIRMED_VIOLATION hoặc DISMISSED.");
   }
 
-  const rid = Number(ratingId);
-  const pool = getDBPool();
-  const upd = await pool
-    .request()
-    .input("rid", sqlObj.BigInt, rid)
-    .input("decision", sqlObj.VarChar(32), cleanDecision)
-    .input("note", sqlObj.NVarChar(1000), reviewNote ? String(reviewNote).trim().slice(0, 950) : null)
-    .input("adminId", sqlObj.UniqueIdentifier, actor.userId)
-    .query(`
-      UPDATE dbo.chat_conversation_ratings
-      SET admin_review_status = @decision,
-          review_note = @note,
-          reviewed_by_user_id = @adminId,
-          reviewed_at = SYSUTCDATETIME(),
-          updated_at = SYSUTCDATETIME()
-      OUTPUT INSERTED.id, INSERTED.admin_review_status AS adminReviewStatus, INSERTED.reviewed_at AS reviewedAt
-      WHERE id = @rid;
+  const rid = reportInteger(ratingId, "Mã đánh giá");
+  const cleanNote = reportText(reviewNote, "Ghi chú kiểm duyệt", 950);
+  return withTransaction(async (tx) => {
+    const state = await newRequest(tx).input("rid", sqlObj.BigInt, rid).query(`
+      SELECT rating FROM dbo.chat_conversation_ratings WITH (UPDLOCK, HOLDLOCK) WHERE id=@rid;
+      SELECT id FROM dbo.chat_warning_email_attempts WHERE rating_id=@rid AND status='SENDING';
     `);
+    if (!state.recordsets[0][0]) throw chatError(404, "RATING_NOT_FOUND", "Không tìm thấy bản ghi đánh giá.");
+    if (Number(state.recordsets[0][0].rating) > 3) throw chatError(409, "NOT_LOW_RATING", "Chỉ kiểm duyệt vi phạm đối với đánh giá 1–3 sao.");
+    if (state.recordsets[1].length) throw chatError(409, "WARNING_IN_PROGRESS", "Đang gửi cảnh báo cho đánh giá này. Vui lòng chờ gửi xong.");
+    const upd = await newRequest(tx)
+      .input("rid", sqlObj.BigInt, rid)
+      .input("decision", sqlObj.VarChar(32), cleanDecision)
+      .input("note", sqlObj.NVarChar(1000), cleanNote)
+      .input("adminId", sqlObj.UniqueIdentifier, actor.userId)
+      .query(`
+        UPDATE dbo.chat_conversation_ratings
+        SET admin_review_status = @decision,
+            review_note = @note,
+            reviewed_by_user_id = @adminId,
+            reviewed_at = SYSUTCDATETIME(),
+            updated_at = SYSUTCDATETIME()
+        OUTPUT INSERTED.id, INSERTED.admin_review_status AS adminReviewStatus, INSERTED.reviewed_at AS reviewedAt
+        WHERE id = @rid;
+      `);
 
-  if (!upd.recordset[0]) {
-    throw chatError(404, "RATING_NOT_FOUND", "Không tìm thấy bản ghi đánh giá.");
-  }
-  return {
-    ratingId: Number(upd.recordset[0].id),
-    adminReviewStatus: upd.recordset[0].adminReviewStatus,
-    reviewedAt: new Date(upd.recordset[0].reviewedAt).toISOString(),
-  };
+    if (!upd.recordset[0]) {
+      throw chatError(404, "RATING_NOT_FOUND", "Không tìm thấy bản ghi đánh giá.");
+    }
+    return {
+      ratingId: Number(upd.recordset[0].id),
+      adminReviewStatus: upd.recordset[0].adminReviewStatus,
+      reviewedAt: new Date(upd.recordset[0].reviewedAt).toISOString(),
+    };
+  });
 }
 
 /**
  * Triggers warning email outside DB lock cleanly using chat_warning_email_attempts state machine.
  */
-async function sendRatingWarningEmail(actor, ratingId, { adminNote = null } = {}) {
+async function sendRatingWarningEmail(actor, ratingId, { adminNote = null, subject = null, emailBody = null } = {}) {
   assertAdminReportsAccess(actor);
   if (!hasPermission(actor, "chat.warning.send")) {
     throw chatError(403, "FORBIDDEN", "Bạn không có quyền gửi email nhắc nhở CSKH.");
   }
 
-  const rid = Number(ratingId);
+  const rid = reportInteger(ratingId, "Mã đánh giá");
   const pool = getDBPool();
-
-  const loadRes = await pool
-    .request()
-    .input("rid", sqlObj.BigInt, rid)
-    .query(`
-      SELECT TOP 1
-        r.id,
-        r.manager_user_id AS managerUserId,
-        r.rating,
-        r.comment,
-        r.admin_review_status AS adminReviewStatus,
-        a.accommodation_name AS accommodationName,
-        u.full_name AS managerName,
-        COALESCE(NULLIF(LTRIM(RTRIM(u.personal_email)), ''), u.email) AS recipientEmail
-      FROM dbo.chat_conversation_ratings AS r
-      INNER JOIN dbo.accommodations AS a ON a.id = r.accommodation_id
-      LEFT JOIN dbo.users AS u ON u.id = r.manager_user_id
-      WHERE r.id = @rid;
-    `);
-
-  const row = loadRes.recordset[0];
-  if (!row || !row.managerUserId) {
-    throw chatError(404, "RATING_OR_MANAGER_NOT_FOUND", "Không tìm thấy đánh giá hoặc Manager để gửi cảnh báo.");
-  }
-  if (!row.recipientEmail) {
-    throw chatError(400, "MISSING_MANAGER_EMAIL", "Tài khoản Quản lý chưa có địa chỉ email nhận cảnh báo.");
+  const cleanNote = reportText(adminNote, "Ghi chú kiểm duyệt", 950);
+  const cleanSubject = reportText(subject, "Tiêu đề email", 240, { allowEmpty: false });
+  const cleanBody = reportText(emailBody, "Nội dung email", 4000, { allowEmpty: false });
+  if (cleanSubject && /[\r\n]/.test(cleanSubject)) {
+    throw chatError(400, "INVALID_EMAIL_SUBJECT", "Tiêu đề email không được chứa ký tự xuống dòng.");
   }
 
-  // Ensure rating is marked CONFIRMED_VIOLATION if Admin clicks send warning directly from pending
-  if (row.adminReviewStatus === "PENDING_REVIEW") {
-    await pool
-      .request()
+  const { row, attemptId } = await withTransaction(async (tx) => {
+    const loadRes = await newRequest(tx)
       .input("rid", sqlObj.BigInt, rid)
-      .input("adminId", sqlObj.UniqueIdentifier, actor.userId)
-      .input("note", sqlObj.NVarChar(1000), adminNote ? String(adminNote).slice(0, 950) : null)
       .query(`
-        UPDATE dbo.chat_conversation_ratings
-        SET admin_review_status = 'CONFIRMED_VIOLATION',
-            review_note = COALESCE(@note, review_note),
-            reviewed_by_user_id = @adminId,
-            reviewed_at = SYSUTCDATETIME(),
-            updated_at = SYSUTCDATETIME()
-        WHERE id = @rid;
+        SELECT TOP 1
+          r.id,
+          r.manager_user_id AS managerUserId,
+          r.rating,
+          r.comment,
+          r.admin_review_status AS adminReviewStatus,
+          a.accommodation_name AS accommodationName,
+          u.full_name AS managerName,
+          COALESCE(NULLIF(LTRIM(RTRIM(u.personal_email)), ''), u.email) AS recipientEmail
+        FROM dbo.chat_conversation_ratings AS r WITH (UPDLOCK, HOLDLOCK)
+        INNER JOIN dbo.accommodations AS a ON a.id = r.accommodation_id
+        LEFT JOIN dbo.users AS u ON u.id = r.manager_user_id
+        WHERE r.id = @rid;
       `);
-  }
 
-  const cleanNote = adminNote ? String(adminNote).trim().slice(0, 950) : null;
-  const attemptRes = await pool
-    .request()
-    .input("rid", sqlObj.BigInt, rid)
-    .input("mgrId", sqlObj.UniqueIdentifier, row.managerUserId)
-    .input("email", sqlObj.VarChar(255), row.recipientEmail)
-    .input("adminId", sqlObj.UniqueIdentifier, actor.userId)
-    .input("note", sqlObj.NVarChar(1000), cleanNote)
-    .query(`
-      INSERT INTO dbo.chat_warning_email_attempts (
-        rating_id, manager_user_id, recipient_email, status, triggered_by_user_id, note
-      )
-      OUTPUT INSERTED.id
-      VALUES (@rid, @mgrId, @email, 'SENDING', @adminId, @note);
+    const row = loadRes.recordset[0];
+    if (!row || !row.managerUserId) {
+      throw chatError(404, "RATING_OR_MANAGER_NOT_FOUND", "Không tìm thấy đánh giá hoặc Manager để gửi cảnh báo.");
+    }
+    if (!row.recipientEmail) {
+      throw chatError(400, "MISSING_MANAGER_EMAIL", "Tài khoản Quản lý chưa có địa chỉ email nhận cảnh báo.");
+    }
+    if (Number(row.rating) > 3 || !["PENDING_REVIEW", "CONFIRMED_VIOLATION"].includes(row.adminReviewStatus)) {
+      throw chatError(409, "NOT_A_VIOLATION", "Chỉ gửi cảnh báo cho đánh giá thấp đang chờ duyệt hoặc đã xác nhận vi phạm.");
+    }
+    const inFlight = await newRequest(tx).input("rid", sqlObj.BigInt, rid).query(`
+      SELECT id FROM dbo.chat_warning_email_attempts WHERE rating_id=@rid AND status='SENDING';
     `);
+    if (inFlight.recordset.length) throw chatError(409, "WARNING_IN_PROGRESS", "Email cảnh báo đang được gửi. Vui lòng chờ kết quả.");
 
-  const attemptId = Number(attemptRes.recordset[0].id);
+    // Ensure rating is marked CONFIRMED_VIOLATION if Admin clicks send warning directly from pending
+    if (row.adminReviewStatus === "PENDING_REVIEW") {
+      await newRequest(tx)
+        .input("rid", sqlObj.BigInt, rid)
+        .input("adminId", sqlObj.UniqueIdentifier, actor.userId)
+        .input("note", sqlObj.NVarChar(1000), cleanNote)
+        .query(`
+          UPDATE dbo.chat_conversation_ratings
+          SET admin_review_status = 'CONFIRMED_VIOLATION',
+              review_note = COALESCE(@note, review_note),
+              reviewed_by_user_id = @adminId,
+              reviewed_at = SYSUTCDATETIME(),
+              updated_at = SYSUTCDATETIME()
+          WHERE id = @rid;
+        `);
+    }
+
+    const attemptRes = await newRequest(tx)
+      .input("rid", sqlObj.BigInt, rid)
+      .input("mgrId", sqlObj.UniqueIdentifier, row.managerUserId)
+      .input("email", sqlObj.VarChar(255), row.recipientEmail)
+      .input("adminId", sqlObj.UniqueIdentifier, actor.userId)
+      .input("note", sqlObj.NVarChar(1000), cleanNote)
+      .query(`
+        INSERT INTO dbo.chat_warning_email_attempts (
+          rating_id, manager_user_id, recipient_email, status, triggered_by_user_id, note
+        )
+        OUTPUT INSERTED.id
+        VALUES (@rid, @mgrId, @email, 'SENDING', @adminId, @note);
+      `);
+
+    return { row, attemptId: Number(attemptRes.recordset[0].id) };
+  });
 
   // Send SMTP outside any transaction lock
   try {
@@ -369,7 +428,12 @@ async function sendRatingWarningEmail(actor, ratingId, { adminNote = null } = {}
       rating: row.rating,
       customerComment: row.comment,
       adminNote: cleanNote,
+      customSubject: cleanSubject,
+      customBody: cleanBody,
     });
+    if (mailResult?.success !== true || mailResult.method === "dev_log") {
+      throw new Error(mailResult?.error || "SMTP chưa xác nhận nhận email cảnh báo.");
+    }
 
     await pool
       .request()

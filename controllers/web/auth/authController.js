@@ -4,10 +4,8 @@ const { triggerOutboxDrain } = require("../../../services/chat/runtime");
 
 
 async function login(req, res) {
-    console.log("[authController - login] Value của req.body : ", req.body);
 
     const loginResult = await authService.login(req.body, "web");
-    console.log("[authController - login] Ket qua hàm authService.login() : ", loginResult);
 
     if (!loginResult.success) {
         //const statusCode = LOGIN_ERROR_HTTP_STATUS[result.errorCode] ?? 400;
@@ -38,6 +36,7 @@ async function login(req, res) {
         email: loginResult.user.email,
         fullName: loginResult.user.full_name,
         displayName: loginResult.user.display_name,
+        phoneNumber: loginResult.user.phone_number || "",
         role: loginResult.user.role,
         status: loginResult.user.status
     };

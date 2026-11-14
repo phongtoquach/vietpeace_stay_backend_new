@@ -15,6 +15,7 @@ const {
 const { hasPermission } = require("./identity");
 const { appendSystemMessage } = require("./lifecycle");
 const provider = require("./provider");
+const { reportInteger, reportPagination } = require("./report_validation");
 
 function assertManagerAccess(actor) {
   if (!actor || actor.role !== "ACCOMMODATION_MANAGER") {
@@ -409,6 +410,8 @@ async function getStaffConversationMessages(actor, conversationId, { limit = 60,
         sequence,
         sender_actor_key AS senderActorKey,
         sender_type AS senderType,
+        sender_user_id AS senderUserId,
+        (SELECT u.full_name FROM dbo.users u WHERE u.id = chat_messages.sender_user_id) AS senderName,
         message_type AS messageType,
         visibility,
         content,
@@ -708,6 +711,7 @@ async function sendManagerReply(actor, conversationId, { content, clientMessageI
       },
     });
 
+    const firstReplyIso = new Date().toISOString();
     await enqueueOutbox(tx, {
       kind: "SOCKET_EVENT",
       conversationId: cid,
@@ -715,7 +719,13 @@ async function sendManagerReply(actor, conversationId, { content, clientMessageI
       payload: {
         conversationId: cid,
         ownerKey,
-        handoffFirstHumanReplyAt: new Date().toISOString(),
+        handlingMode: "HUMAN",
+        assignedUserId: actor.userId,
+        assignedManagerName: actor.displayName,
+        managerWaitExpiresAt: null,
+        handoffFirstHumanReplyAt: firstReplyIso,
+        pendingRatingHandoffId: conv.currentHandoffId ? Number(conv.currentHandoffId) : null,
+        pendingRatingManagerName: actor.displayName,
       },
     });
 
@@ -826,21 +836,34 @@ async function returnConversationToAi(actor, conversationId) {
     throw chatError(403, "FORBIDDEN", "Bạn không có quyền trả hội thoại về AI.");
   }
   const cid = Number(conversationId);
-  await withTransaction(async (tx) => {
+  const updated = await withTransaction(async (tx) => {
     await lockConversationsInOrder(tx, [cid]);
     const conv = await assertStaffConversationAccess(actor, cid, tx);
     if (conv.handlingMode !== "HUMAN" || String(conv.assignedUserId || "").toLowerCase() !== actor.userId.toLowerCase()) {
       throw chatError(409, "INVALID_STATE", "Chỉ có thể trả về AI khi Quản lý đang tiếp nhận.");
     }
 
+    let pendingRatingHandoffId = null;
     if (conv.currentHandoffId) {
-      await newRequest(tx)
+      const hCheck = await newRequest(tx)
         .input("hid", sqlObj.BigInt, conv.currentHandoffId)
         .query(`
+          SELECT TOP 1
+            h.id,
+            h.first_human_reply_at AS firstHumanReplyAt,
+            CASE WHEN r.id IS NOT NULL THEN 1 ELSE 0 END AS alreadyRated
+          FROM dbo.chat_handoff_sessions AS h
+          LEFT JOIN dbo.chat_conversation_ratings AS r ON r.handoff_id = h.id
+          WHERE h.id = @hid;
+
           UPDATE dbo.chat_handoff_sessions
           SET status = 'RESOLVED', ended_at = SYSUTCDATETIME(), ended_reason = 'RETURNED_TO_AI'
           WHERE id = @hid AND status = 'CLAIMED';
         `);
+      const hr = hCheck.recordset?.[0];
+      if (hr?.firstHumanReplyAt && !hr.alreadyRated) {
+        pendingRatingHandoffId = Number(hr.id);
+      }
     }
 
     await newRequest(tx)
@@ -860,6 +883,7 @@ async function returnConversationToAi(actor, conversationId) {
       tx,
       cid,
       `Quản lý ${actor.displayName} đã hoàn tất trao đổi trực tiếp và chuyển hội thoại về Trợ lý AI VietPeace Stay.`,
+      conv.currentHandoffId ? { handoffId: Number(conv.currentHandoffId) } : {},
     );
 
     const ownerKey = conv.customerUserId
@@ -882,11 +906,36 @@ async function returnConversationToAi(actor, conversationId) {
         ownerKey,
         handlingMode: "AI",
         assignedUserId: null,
+        currentHandoffId: null,
+        managerWaitExpiresAt: null,
+        ...(pendingRatingHandoffId
+          ? {
+              pendingRatingHandoffId,
+              pendingRatingManagerName: actor.displayName,
+            }
+          : {}),
       },
     });
+
+    return {
+      ...conv,
+      handlingMode: "AI",
+      assignedUserId: null,
+      assignedManagerName: null,
+      currentHandoffId: null,
+      handoffStatus: null,
+      handoffRequestedAt: null,
+      handoffExpiresAt: null,
+      handoffClaimedAt: null,
+      managerWaitExpiresAt: null,
+      controlRevision: Number(conv.controlRevision || 0) + 1,
+      lastSequence: Number(sysMsg.sequence),
+      lastMessageAt: sysMsg.createdAt,
+      lastMessagePreview: previewText(sysMsg.content),
+      updatedAt: new Date().toISOString(),
+    };
   });
 
-  const updated = await assertStaffConversationAccess(actor, cid);
   return formatStaffConvRow(updated);
 }
 
@@ -898,14 +947,27 @@ async function resolveConversationByManager(actor, conversationId) {
     const conv = await assertStaffConversationAccess(actor, cid, tx);
     if (conv.status === "RESOLVED") return;
 
+    let pendingRatingHandoffId = null;
     if (conv.currentHandoffId) {
-      await newRequest(tx)
+      const hCheck = await newRequest(tx)
         .input("hid", sqlObj.BigInt, conv.currentHandoffId)
         .query(`
+          SELECT TOP 1
+            h.id,
+            h.first_human_reply_at AS firstHumanReplyAt,
+            CASE WHEN r.id IS NOT NULL THEN 1 ELSE 0 END AS alreadyRated
+          FROM dbo.chat_handoff_sessions AS h
+          LEFT JOIN dbo.chat_conversation_ratings AS r ON r.handoff_id = h.id
+          WHERE h.id = @hid;
+
           UPDATE dbo.chat_handoff_sessions
           SET status = 'RESOLVED', ended_at = SYSUTCDATETIME(), ended_reason = 'MANAGER_RESOLVED'
           WHERE id = @hid AND status IN ('PENDING', 'CLAIMED');
         `);
+      const hr = hCheck.recordset?.[0];
+      if (hr?.firstHumanReplyAt && !hr.alreadyRated) {
+        pendingRatingHandoffId = Number(hr.id);
+      }
     }
 
     await newRequest(tx)
@@ -925,6 +987,7 @@ async function resolveConversationByManager(actor, conversationId) {
       tx,
       cid,
       "Phiên tư vấn trực tiếp đã được Quản lý đánh dấu hoàn tất. Cảm ơn Quý khách đã sử dụng VietPeace Stay!",
+      conv.currentHandoffId ? { handoffId: Number(conv.currentHandoffId) } : {},
     );
 
     const ownerKey = conv.customerUserId
@@ -942,7 +1005,18 @@ async function resolveConversationByManager(actor, conversationId) {
       kind: "SOCKET_EVENT",
       conversationId: cid,
       eventName: "conversation:updated",
-      payload: { conversationId: cid, ownerKey, status: "RESOLVED" },
+      payload: {
+        conversationId: cid,
+        ownerKey,
+        status: "RESOLVED",
+        managerWaitExpiresAt: null,
+        ...(pendingRatingHandoffId
+          ? {
+              pendingRatingHandoffId,
+              pendingRatingManagerName: actor.displayName,
+            }
+          : {}),
+      },
     });
   });
 
@@ -1089,7 +1163,7 @@ async function getConversationAuditEvents(actor, conversationId) {
 }
 
 async function getSupportSettings(actor) {
-  if (!hasPermission(actor, "chat.settings.manage")) {
+  if (actor?.role !== "ADMIN" || !hasPermission(actor, "chat.settings.manage")) {
     throw chatError(403, "FORBIDDEN", "Chỉ Admin mới được xem/sửa cấu hình Chat.");
   }
   const pool = getDBPool();
@@ -1105,14 +1179,19 @@ async function getSupportSettings(actor) {
 }
 
 async function updateSupportSettings(actor, body = {}) {
-  if (!hasPermission(actor, "chat.settings.manage")) {
+  if (actor?.role !== "ADMIN" || !hasPermission(actor, "chat.settings.manage")) {
     throw chatError(403, "FORBIDDEN", "Chỉ Admin mới được sửa cấu hình Chat.");
   }
   const pool = getDBPool();
-  const accomId = body.accommodationId ? Number(body.accommodationId) : null;
-  const aiEnabled = body.aiEnabled !== undefined ? Boolean(body.aiEnabled) : true;
-  const humanEnabled = body.humanHandoffEnabled !== undefined ? Boolean(body.humanHandoffEnabled) : true;
-  const claimSec = Math.min(Math.max(Number(body.claimTimeoutSeconds || 300), 30), 3600);
+  const accomId = body.accommodationId == null ? null : reportInteger(body.accommodationId, "Mã cơ sở", { max: 2147483647 });
+  for (const key of ["aiEnabled", "humanHandoffEnabled"]) {
+    if (body[key] !== undefined && typeof body[key] !== "boolean") {
+      throw chatError(400, "INVALID_SETTINGS", "Cấu hình bật/tắt phải là true hoặc false.");
+    }
+  }
+  const aiEnabled = body.aiEnabled ?? true;
+  const humanEnabled = body.humanHandoffEnabled ?? true;
+  const claimSec = reportInteger(body.claimTimeoutSeconds, "Thời gian chờ", { min: 30, max: 3600, fallback: 300 });
   const offlineMsg = body.offlineMessage ? String(body.offlineMessage).slice(0, 500) : null;
 
   await pool
@@ -1125,7 +1204,7 @@ async function updateSupportSettings(actor, body = {}) {
     .input("offlineMsg", sqlObj.NVarChar(500), offlineMsg)
     .input("adminId", sqlObj.UniqueIdentifier, actor.userId)
     .query(`
-      MERGE dbo.chat_support_settings AS target
+      MERGE dbo.chat_support_settings WITH (HOLDLOCK) AS target
       USING (SELECT @scopeKey AS accommodation_scope_key) AS src
       ON target.accommodation_scope_key = src.accommodation_scope_key
       WHEN MATCHED THEN
@@ -1174,12 +1253,13 @@ async function getAdminReportsSummary(actor) {
 
 async function listMissedHandoffReports(actor, { unreadOnly = false, limit = 50, offset = 0 } = {}) {
   assertReportsAdmin(actor);
+  const page = reportPagination({ limit, offset });
   const pool = getDBPool();
   const res = await pool
     .request()
     .input("unreadOnly", sqlObj.Bit, unreadOnly ? 1 : 0)
-    .input("limit", sqlObj.Int, Math.min(Math.max(Number(limit) || 50, 1), 100))
-    .input("offset", sqlObj.Int, Math.max(Number(offset) || 0, 0))
+    .input("limit", sqlObj.Int, page.limit)
+    .input("offset", sqlObj.Int, page.offset)
     .query(`
       SELECT
         r.id,
@@ -1201,7 +1281,7 @@ async function listMissedHandoffReports(actor, { unreadOnly = false, limit = 50,
       FROM dbo.chat_missed_handoff_reports AS r
       LEFT JOIN dbo.users AS u ON u.id = r.manager_user_id
       WHERE (@unreadOnly = 0 OR r.admin_read_at IS NULL)
-      ORDER BY CASE WHEN r.admin_read_at IS NULL THEN 0 ELSE 1 END, r.created_at DESC
+      ORDER BY CASE WHEN r.admin_read_at IS NULL THEN 0 ELSE 1 END, r.created_at DESC, r.id DESC
       OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY;
     `);
 
@@ -1221,7 +1301,7 @@ async function listMissedHandoffReports(actor, { unreadOnly = false, limit = 50,
 
 async function ackMissedHandoffReport(actor, reportId) {
   assertReportsAdmin(actor);
-  const rid = Number(reportId);
+  const rid = reportInteger(reportId, "Mã báo cáo");
   const pool = getDBPool();
   const res = await pool
     .request()
