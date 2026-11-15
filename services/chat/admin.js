@@ -32,6 +32,25 @@ function assertStaffChatRead(actor) {
   }
 }
 
+const OWNER_PARTITION_SQL = `
+  CASE
+    WHEN c.customer_user_id IS NOT NULL THEN CONCAT('cust:', LOWER(CAST(c.customer_user_id AS VARCHAR(40))))
+    WHEN c.guest_session_id IS NOT NULL THEN CONCAT('guest:', LOWER(CAST(c.guest_session_id AS VARCHAR(40))))
+    ELSE CONCAT('conv:', CAST(c.id AS VARCHAR(20)))
+  END
+`;
+
+const CANONICAL_CONV_RANK_ORDER_SQL = `
+  CASE WHEN c.status = 'OPEN' THEN 0 ELSE 1 END,
+  CASE
+    WHEN c.handling_mode = 'HUMAN' THEN 0
+    WHEN c.handling_mode = 'WAITING_HUMAN' THEN 1
+    ELSE 2
+  END,
+  COALESCE(c.last_message_at, c.created_at) DESC,
+  c.id DESC
+`;
+
 async function listStaffConversations(actor, { accommodationId = null, status = "ALL", handlingMode = "ALL" } = {}) {
   assertStaffChatRead(actor);
   const pool = getDBPool();
@@ -53,6 +72,23 @@ async function listStaffConversations(actor, { accommodationId = null, status = 
       .input("statusFilter", sqlObj.VarChar(16), statusFilter)
       .input("modeFilter", sqlObj.VarChar(20), modeFilter)
       .query(`
+        ;WITH canonical AS (
+          SELECT
+            c.id,
+            ROW_NUMBER() OVER (
+              PARTITION BY ${OWNER_PARTITION_SQL}
+              ORDER BY ${CANONICAL_CONV_RANK_ORDER_SQL}
+            ) AS rn
+          FROM dbo.chat_conversations AS c
+          LEFT JOIN dbo.chat_handoff_sessions AS h ON h.id = c.current_handoff_id
+          WHERE c.scope_type = 'PROPERTY'
+            AND c.accommodation_id = @accomId
+            AND c.manager_assignment_epoch_id = @epochId
+            AND (
+              (c.handling_mode = 'WAITING_HUMAN' AND h.target_manager_user_id = @mgrId)
+              OR (c.assigned_user_id = @mgrId)
+            )
+        )
         SELECT
           c.id,
           c.scope_type AS scopeType,
@@ -94,7 +130,8 @@ async function listStaffConversations(actor, { accommodationId = null, status = 
           ) AS unreadCount,
           c.created_at AS createdAt,
           c.updated_at AS updatedAt
-        FROM dbo.chat_conversations AS c
+        FROM canonical AS can
+        INNER JOIN dbo.chat_conversations AS c ON c.id = can.id
         INNER JOIN dbo.accommodations AS a ON a.id = c.accommodation_id
         LEFT JOIN dbo.users AS cu ON cu.id = c.customer_user_id
         LEFT JOIN dbo.chat_handoff_sessions AS h ON h.id = c.current_handoff_id
@@ -105,13 +142,7 @@ async function listStaffConversations(actor, { accommodationId = null, status = 
           WHERE conversation_id = c.id AND participant_role IN ('CUSTOMER', 'GUEST')
           ORDER BY id DESC
         ) AS op
-        WHERE c.scope_type = 'PROPERTY'
-          AND c.accommodation_id = @accomId
-          AND c.manager_assignment_epoch_id = @epochId
-          AND (
-            (c.handling_mode = 'WAITING_HUMAN' AND h.target_manager_user_id = @mgrId)
-            OR (c.assigned_user_id = @mgrId)
-          )
+        WHERE can.rn = 1
           AND (@statusFilter IS NULL OR c.status = @statusFilter)
           AND (@modeFilter IS NULL OR c.handling_mode = @modeFilter)
         ORDER BY
@@ -122,7 +153,7 @@ async function listStaffConversations(actor, { accommodationId = null, status = 
     return res.recordset.map((r) => formatStaffConvRow(r));
   }
 
-  // ADMIN (chat.supervise) reads PERSISTENT conversations only
+  // ADMIN (chat.supervise) reads one canonical unified PERSISTENT conversation per customer/guest
   if (!hasPermission(actor, "chat.supervise")) {
     throw chatError(403, "FORBIDDEN", "Admin thiếu quyền giám sát hội thoại.");
   }
@@ -137,6 +168,16 @@ async function listStaffConversations(actor, { accommodationId = null, status = 
     .input("statusFilter", sqlObj.VarChar(16), statusFilter)
     .input("modeFilter", sqlObj.VarChar(20), modeFilter)
     .query(`
+      ;WITH canonical AS (
+        SELECT
+          c.id,
+          ROW_NUMBER() OVER (
+            PARTITION BY ${OWNER_PARTITION_SQL}
+            ORDER BY ${CANONICAL_CONV_RANK_ORDER_SQL}
+          ) AS rn
+        FROM dbo.chat_conversations AS c
+        WHERE c.retention_state = 'PERSISTENT'
+      )
       SELECT TOP 100
         c.id,
         c.scope_type AS scopeType,
@@ -171,7 +212,8 @@ async function listStaffConversations(actor, { accommodationId = null, status = 
         CAST(0 AS INT) AS unreadCount,
         c.created_at AS createdAt,
         c.updated_at AS updatedAt
-      FROM dbo.chat_conversations AS c
+      FROM canonical AS can
+      INNER JOIN dbo.chat_conversations AS c ON c.id = can.id
       LEFT JOIN dbo.accommodations AS a ON a.id = c.accommodation_id
       LEFT JOIN dbo.users AS cu ON cu.id = c.customer_user_id
       LEFT JOIN dbo.users AS mu ON mu.id = c.assigned_user_id
@@ -182,7 +224,7 @@ async function listStaffConversations(actor, { accommodationId = null, status = 
         WHERE conversation_id = c.id AND participant_role IN ('CUSTOMER', 'GUEST')
         ORDER BY id DESC
       ) AS op
-      WHERE c.retention_state = 'PERSISTENT'
+      WHERE can.rn = 1
         AND (@accomId IS NULL OR c.accommodation_id = @accomId)
         AND (@statusFilter IS NULL OR c.status = @statusFilter)
         AND (@modeFilter IS NULL OR c.handling_mode = @modeFilter)
@@ -246,10 +288,25 @@ async function listSuperviseAccommodations(actor) {
   }
 
   const res = await pool.request().query(`
-    SELECT a.id, a.accommodation_name AS accommodationName,
-      (SELECT COUNT(*) FROM dbo.chat_conversations c WHERE c.accommodation_id = a.id AND c.retention_state = 'PERSISTENT') AS conversationCount
-    FROM dbo.accommodations a
+    ;WITH canonical AS (
+      SELECT
+        c.accommodation_id,
+        ROW_NUMBER() OVER (
+          PARTITION BY ${OWNER_PARTITION_SQL}
+          ORDER BY ${CANONICAL_CONV_RANK_ORDER_SQL}
+        ) AS rn
+      FROM dbo.chat_conversations AS c
+      WHERE c.retention_state = 'PERSISTENT'
+    )
+    SELECT
+      a.id,
+      a.accommodation_name AS accommodationName,
+      COUNT(can.rn) AS conversationCount
+    FROM dbo.accommodations AS a
+    LEFT JOIN canonical AS can
+      ON can.accommodation_id = a.id AND can.rn = 1
     WHERE a.status = 1 AND a.deleted_at IS NULL
+    GROUP BY a.id, a.accommodation_name
     ORDER BY conversationCount DESC, a.accommodation_name ASC;
   `);
   return res.recordset.map((r) => ({
@@ -392,6 +449,41 @@ async function assertStaffConversationAccess(actor, conversationId, txOrPool = g
   return row;
 }
 
+function formatStaffMsgRow(m) {
+  return {
+    ...m,
+    id: Number(m.id),
+    conversationId: Number(m.conversationId),
+    sequence: Number(m.sequence),
+    handoffId: m.handoffId ? Number(m.handoffId) : null,
+    payload: parseJsonSafe(m.payloadJson, null),
+    createdAt: new Date(m.createdAt).toISOString(),
+  };
+}
+
+function mergeStaffNotesChronologically(baseMessages, extraNotes) {
+  if (!extraNotes.length) return baseMessages;
+  const seenIds = new Set(baseMessages.map((m) => Number(m.id)));
+  const pending = extraNotes.filter((n) => !seenIds.has(Number(n.id)));
+  if (!pending.length) return baseMessages;
+
+  const merged = [];
+  let noteIdx = 0;
+  for (const msg of baseMessages) {
+    const msgTs = new Date(msg.createdAt).getTime();
+    while (noteIdx < pending.length && new Date(pending[noteIdx].createdAt).getTime() <= msgTs) {
+      merged.push(pending[noteIdx]);
+      noteIdx += 1;
+    }
+    merged.push(msg);
+  }
+  while (noteIdx < pending.length) {
+    merged.push(pending[noteIdx]);
+    noteIdx += 1;
+  }
+  return merged;
+}
+
 async function getStaffConversationMessages(actor, conversationId, { limit = 60, beforeSequence = null } = {}) {
   const conv = await assertStaffConversationAccess(actor, conversationId);
   const pool = getDBPool();
@@ -427,15 +519,47 @@ async function getStaffConversationMessages(actor, conversationId, { limit = 60,
       ORDER BY sequence DESC;
     `);
 
-  return res.recordset.reverse().map((m) => ({
-    ...m,
-    id: Number(m.id),
-    conversationId: Number(m.conversationId),
-    sequence: Number(m.sequence),
-    handoffId: m.handoffId ? Number(m.handoffId) : null,
-    payload: parseJsonSafe(m.payloadJson, null),
-    createdAt: new Date(m.createdAt).toISOString(),
-  }));
+  const baseMessages = res.recordset.reverse().map(formatStaffMsgRow);
+
+  // When Admin supervises a consolidated customer thread, include prior STAFF notes from earlier resolved rows
+  if (actor.role === "ADMIN" && !beforeSequence && (conv.customerUserId || conv.guestSessionId)) {
+    const notesRes = await pool
+      .request()
+      .input("cid", sqlObj.BigInt, Number(conversationId))
+      .input("custUid", sqlObj.UniqueIdentifier, conv.customerUserId || null)
+      .input("guestSid", sqlObj.UniqueIdentifier, conv.guestSessionId || null)
+      .query(`
+        SELECT
+          m.id,
+          m.conversation_id AS conversationId,
+          m.sequence,
+          m.sender_actor_key AS senderActorKey,
+          m.sender_type AS senderType,
+          m.sender_user_id AS senderUserId,
+          (SELECT u.full_name FROM dbo.users u WHERE u.id = m.sender_user_id) AS senderName,
+          m.message_type AS messageType,
+          m.visibility,
+          m.content,
+          m.payload_json AS payloadJson,
+          m.client_message_id AS clientMessageId,
+          m.handoff_id AS handoffId,
+          m.created_at AS createdAt
+        FROM dbo.chat_messages AS m
+        INNER JOIN dbo.chat_conversations AS c2 ON c2.id = m.conversation_id
+        WHERE m.conversation_id <> @cid
+          AND c2.retention_state = 'PERSISTENT'
+          AND (
+            (@custUid IS NOT NULL AND c2.customer_user_id = @custUid)
+            OR (@custUid IS NULL AND @guestSid IS NOT NULL AND c2.guest_session_id = @guestSid)
+          )
+          AND m.visibility = 'STAFF'
+        ORDER BY m.created_at ASC, m.id ASC;
+      `);
+    const extraNotes = notesRes.recordset.map(formatStaffMsgRow);
+    return mergeStaffNotesChronologically(baseMessages, extraNotes);
+  }
+
+  return baseMessages;
 }
 
 async function claimConversation(actor, conversationId) {

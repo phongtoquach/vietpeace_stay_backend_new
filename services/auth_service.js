@@ -5,6 +5,7 @@ const bcrypt = require("bcryptjs");
 const { getDBPool } = require("../configs/database");
 const mailService = require("./mail_service");
 const { invalidateActorAuthCache } = require("./chat/identity");
+const { generateTemporaryPassword } = require("../utils/account_generator");
 
 const EMAIL_REGEX =
     /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
@@ -12,6 +13,10 @@ const PHONE_REGEX = /^[+0-9 ()\-]{9,20}$/;
 
 const EMAIL_VERIFICATION_TTL_HOURS = 24;
 const EMAIL_VERIFICATION_RESEND_COOLDOWN_SECONDS = 60;
+const EMAIL_VERIFICATION_MAX_ATTEMPTS = 5;
+const EMAIL_VERIFICATION_PENDING_SECONDS = 120;
+const FORGOT_PASSWORD_COOLDOWN_SECONDS = 60;
+const forgotPasswordCooldowns = new Map();
 
 const ADMIN_PANEL_ROLES = Object.freeze(["ADMIN", "ACCOMMODATION_MANAGER"]);
 
@@ -62,6 +67,8 @@ function validateCredentials(body) {
         errors.password = "Vui lòng nhập mật khẩu.";
     } else if (password.length < 8) {
         errors.password = "Mật khẩu phải có ít nhất 8 ký tự.";
+    } else if (Buffer.byteLength(password, "utf8") > 72) {
+        errors.password = "Mật khẩu không được vượt quá 72 byte UTF-8.";
     }
 
     return {
@@ -69,6 +76,12 @@ function validateCredentials(body) {
         password,
         errors
     };
+}
+
+function validateCustomerLoginInput(body) {
+    if (!isValidBody(body)) return failure("REQUEST_BODY_INVALID", "Request body không hợp lệ.");
+    const { errors } = validateCredentials(body);
+    return Object.keys(errors).length ? failure("DATA_INVALID", "Dữ liệu không hợp lệ.", errors) : null;
 }
 
 // Chỉ trả những thuộc tính được phép đưa ra frontend.
@@ -159,14 +172,6 @@ async function login(body, audience = "web") {
         );
     }
 
-    // Chỉ kiểm tra và thông báo trạng thái khi password đã đúng.
-    if (user.status === 0) {
-        return failure(
-            "EMAIL_NOT_VERIFIED",
-            "Tài khoản chưa được xác thực email."
-        );
-    }
-
     if (user.status === 2) {
         return failure(
             "ACCOUNT_INACTIVE",
@@ -174,17 +179,66 @@ async function login(body, audience = "web") {
         );
     }
 
+    const allowedRoles = LOGIN_ROLES[audience];
+
+    if (!allowedRoles.includes(user.role)) {
+        return failure("LOGIN_FORBIDDEN", "Tài khoản này không có quyền đăng nhập vào " + ((audience === "admin") ? "Hệ thống quản trị !" : "Website đặt phòng !"));
+    }
+
+    // Kiểm tra và kích hoạt bằng mã xác nhận trong lần đăng nhập đầu tiên (status = 0).
+    if (user.status === 0) {
+        if (audience !== "web") {
+            return failure(
+                "EMAIL_NOT_VERIFIED",
+                "Tài khoản chưa được xác thực email."
+            );
+        }
+
+        const rawVerificationCode =
+            body.verificationCode ?? body.verification_code ?? body.otpCode;
+        const trimmedCode =
+            typeof rawVerificationCode === "string"
+                ? rawVerificationCode.trim()
+                : "";
+
+        if (!trimmedCode) {
+            return failure(
+                "EMAIL_VERIFICATION_CODE_REQUIRED",
+                "Đây là lần đăng nhập đầu tiên. Vui lòng nhập mã xác nhận gồm 6 chữ số đã được gửi tới email của bạn để kích hoạt tài khoản.",
+                {},
+                {
+                    requiresVerificationCode: true,
+                    email: user.email,
+                }
+            );
+        }
+
+        const activationResult = await activateCustomerByVerificationCode({
+            userId: user.id,
+            rawCode: trimmedCode,
+        });
+
+        if (!activationResult.success) {
+            return activationResult;
+        }
+
+        const activatedUser = activationResult.user;
+        activatedUser.last_login_at = activatedUser.last_login_at
+            ? activatedUser.last_login_at.toISOString().slice(0, 19).replace("T", " ")
+            : "";
+
+        return {
+            success: true,
+            activatedOnFirstLogin: true,
+            user: generatePublicUserInfo(activatedUser),
+        };
+    }
+
     if (user.status !== 1) {
         return failure(
             "ACCOUNT_STATUS_INVALID",
             "Trạng thái tài khoản không hợp lệ."
         );
-    }
-
-    const allowedRoles = LOGIN_ROLES[audience];
-
-    if (!allowedRoles.includes(user.role)) {
-        return failure("LOGIN_FORBIDDEN", "Tài khoản này không có quyền đăng nhập vào " + ((audience === "admin") ? "Hệ thống quản trị !" : "Website đặt phòng !"));
     }
 
     // Kiểm tra phạm vi cơ sở lưu trú của Manager
@@ -309,18 +363,24 @@ function hashVerificationToken(rawToken) {
         .digest("hex");
 }
 
-function buildCustomerVerificationUrl(rawToken) {
-    const rawDomain = (process.env.WEB_DOMAIN || "http://localhost:5178")
-        .trim()
-        .replace(/^["']|["']$/g, "");
-    const verifyUrl = new URL("/verify-email", rawDomain);
-    verifyUrl.searchParams.set("token", rawToken);
-    return verifyUrl.toString();
+function hashVerificationCode(userId, rawCode) {
+    return crypto
+        .createHash("sha256")
+        .update(`otp:${String(userId).trim().toLowerCase()}:${String(rawCode).trim()}`)
+        .digest("hex");
 }
 
-async function issueCustomerVerificationToken(transaction, userId, email) {
-    const rawToken = crypto.randomBytes(32).toString("hex");
-    const tokenHash = hashVerificationToken(rawToken);
+async function issueCustomerVerificationCode(transaction, userId, email) {
+    let rawCode, codeHash;
+    // A previously used/revoked six-digit code must never become valid again.
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+        rawCode = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+        codeHash = hashVerificationCode(userId, rawCode);
+        const exists = await new sql.Request(transaction).input("hash", sql.VarChar(150), codeHash)
+            .query("SELECT id FROM dbo.email_verification_tokens WHERE token_hash=@hash;");
+        if (!exists.recordset.length) break;
+        if (attempt === 19) throw new Error("Cannot issue a unique verification code.");
+    }
 
     await new sql.Request(transaction)
         .input("userId", sql.UniqueIdentifier, userId)
@@ -332,27 +392,72 @@ async function issueCustomerVerificationToken(transaction, userId, email) {
               AND revoked_at IS NULL;
         `);
 
-    await new sql.Request(transaction)
+    const inserted = await new sql.Request(transaction)
         .input("userId", sql.UniqueIdentifier, userId)
         .input("email", sql.VarChar(255), email)
-        .input("tokenHash", sql.VarChar(150), tokenHash)
+        .input("tokenHash", sql.VarChar(150), codeHash)
         .input("ttlHours", sql.Int, EMAIL_VERIFICATION_TTL_HOURS)
         .query(`
             INSERT INTO dbo.email_verification_tokens (
                 user_id,
                 email,
                 token_hash,
-                expires_at
+                expires_at,
+                delivery_status
             )
+            OUTPUT INSERTED.id
             VALUES (
                 @userId,
                 @email,
                 @tokenHash,
-                DATEADD(hour, @ttlHours, SYSDATETIME())
+                DATEADD(hour, @ttlHours, SYSDATETIME()),
+                'PENDING'
             );
         `);
 
-    return rawToken;
+    return { rawCode, tokenId: inserted.recordset[0].id };
+}
+
+async function verificationRetryAfter(transaction, userId) {
+    const result = await new sql.Request(transaction).input("userId", sql.UniqueIdentifier, userId)
+        .input("cooldown", sql.Int, EMAIL_VERIFICATION_RESEND_COOLDOWN_SECONDS)
+        .input("pending", sql.Int, EMAIL_VERIFICATION_PENDING_SECONDS).query(`
+            SELECT ISNULL(MAX(CASE delivery_status
+                WHEN 'SENT' THEN @cooldown-DATEDIFF(second,created_at,SYSDATETIME())
+                WHEN 'PENDING' THEN @pending-DATEDIFF(second,created_at,SYSDATETIME())
+                ELSE 0 END),0) AS retryAfterSeconds
+            FROM dbo.email_verification_tokens WITH (HOLDLOCK) WHERE user_id=@userId;
+        `);
+    return Math.max(0, result.recordset[0]?.retryAfterSeconds || 0);
+}
+
+function verificationCooldownFailure(retryAfterSeconds) {
+    return failure("VERIFICATION_RESEND_TOO_FREQUENT",
+        `Vui lòng đợi ${retryAfterSeconds} giây trước khi yêu cầu gửi lại mã xác nhận.`, {}, { retryAfterSeconds });
+}
+
+async function deliverCustomerVerification(user, verification) {
+    let mailResult;
+    try {
+        mailResult = await mailService.sendCustomerVerificationEmail({
+            toEmail: user.email, fullName: user.full_name,
+            verificationCode: verification.rawCode, expiresInHours: EMAIL_VERIFICATION_TTL_HOURS,
+        });
+    } catch {
+        mailResult = { success: false, method: "smtp_error" };
+    }
+    const sent = mailResult?.success === true && mailResult.method !== "dev_log";
+    const updated = await getDBPool().request().input("id", sql.BigInt, verification.tokenId)
+        .input("status", sql.VarChar(16), sent ? "SENT" : "FAILED").query(`
+            UPDATE dbo.email_verification_tokens
+            SET delivery_status=@status,
+                revoked_at=CASE WHEN @status='FAILED' THEN
+                    CASE WHEN SYSDATETIME()>=created_at THEN SYSDATETIME() ELSE created_at END
+                    ELSE revoked_at END
+            OUTPUT INSERTED.id
+            WHERE id=@id AND delivery_status='PENDING' AND used_at IS NULL AND revoked_at IS NULL;
+        `);
+    return { success: sent && updated.recordset.length > 0, method: mailResult?.method || "unknown" };
 }
 
 function validateCustomerProfileFields(body, { preserveMissingDisplayName = false } = {}) {
@@ -475,7 +580,7 @@ async function register(body) {
     const transaction = new sql.Transaction(getDBPool());
     let transactionCommitted = false;
     let savedUser = null;
-    let rawToken = null;
+    let verification = null;
 
     try {
         await transaction.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
@@ -501,6 +606,11 @@ async function register(body) {
                         email: "Email đã được sử dụng.",
                     }
                 );
+            }
+            const retryAfterSeconds = await verificationRetryAfter(transaction, existing.id);
+            if (retryAfterSeconds > 0) {
+                await transaction.rollback();
+                return verificationCooldownFailure(retryAfterSeconds);
             }
 
             const updated = await new sql.Request(transaction)
@@ -577,7 +687,7 @@ async function register(body) {
             savedUser = inserted.recordset[0];
         }
 
-        rawToken = await issueCustomerVerificationToken(transaction, savedUser.id, savedUser.email);
+        verification = await issueCustomerVerificationCode(transaction, savedUser.id, savedUser.email);
 
         await transaction.commit();
         transactionCommitted = true;
@@ -607,28 +717,287 @@ async function register(body) {
         throw error;
     }
 
-    const verificationUrl = buildCustomerVerificationUrl(rawToken);
-    const mailResult = await mailService.sendCustomerVerificationEmail({
-        toEmail: savedUser.email,
-        fullName: savedUser.full_name,
-        verificationUrl,
-        expiresInHours: EMAIL_VERIFICATION_TTL_HOURS,
-    });
+    const mailResult = await deliverCustomerVerification(savedUser, verification);
 
     return {
         success: true,
         user: generatePublicUserInfo(savedUser),
         emailSent: Boolean(mailResult?.success),
+        cooldownSeconds: mailResult?.success ? EMAIL_VERIFICATION_RESEND_COOLDOWN_SECONDS : 0,
         emailDeliveryMethod: mailResult?.method || "unknown",
         expiresInHours: EMAIL_VERIFICATION_TTL_HOURS,
         message: mailResult?.success
-            ? "Đăng ký thành công! Vui lòng kiểm tra hộp thư email để xác thực tài khoản trước khi đăng nhập."
-            : "Tài khoản đã được tạo nhưng hệ thống chưa gửi được email xác thực. Vui lòng thử bấm 'Gửi lại email xác thực'.",
+            ? "Đăng ký thành công! Hệ thống đã gửi email chứa mã xác nhận để bạn nhập khi đăng nhập lần đầu tiên."
+            : "Tài khoản đã được tạo nhưng hệ thống chưa gửi được email chứa mã xác nhận. Vui lòng thử bấm 'Gửi lại mã xác nhận'.",
     };
 }
 
-async function verifyCustomerEmail(rawToken) {
-    const token = typeof rawToken === "string" ? rawToken.trim() : "";
+async function activateCustomerByVerificationCode({ userId, rawCode }) {
+    const code = typeof rawCode === "string" ? rawCode.trim() : "";
+
+    if (!/^\d{6}$/.test(code)) {
+        return failure(
+            "INVALID_VERIFICATION_CODE",
+            "Mã xác nhận phải gồm đúng 6 chữ số.",
+            { verificationCode: "Mã xác nhận gồm đúng 6 chữ số." },
+            { requiresVerificationCode: true }
+        );
+    }
+
+    const codeHash = hashVerificationCode(userId, code);
+    const transaction = new sql.Transaction(getDBPool());
+    let transactionCommitted = false;
+
+    try {
+        await transaction.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
+
+        // Use the same user -> token lock order as register/resend. The counter
+        // is persisted and serialized across processes and simultaneous guesses.
+        await new sql.Request(transaction).input("id", sql.UniqueIdentifier, userId)
+            .query("SELECT id FROM dbo.users WITH (UPDLOCK, HOLDLOCK) WHERE id=@id;");
+        const active = await new sql.Request(transaction).input("id", sql.UniqueIdentifier, userId).query(`
+            SELECT TOP 1 id, failed_attempts,
+                CASE WHEN expires_at<=SYSDATETIME() THEN 1 ELSE 0 END AS is_expired
+            FROM dbo.email_verification_tokens WITH (UPDLOCK, HOLDLOCK)
+            WHERE user_id=@id AND used_at IS NULL AND revoked_at IS NULL AND delivery_status='SENT'
+            ORDER BY created_at DESC,id DESC;
+        `);
+        const activeCode = active.recordset[0];
+        const attemptsExceeded = () => failure("VERIFICATION_CODE_ATTEMPTS_EXCEEDED",
+            "Mã xác nhận đã bị khóa sau 5 lần nhập sai. Vui lòng gửi lại mã xác nhận mới.",
+            { verificationCode: "Mã đã bị khóa. Vui lòng gửi lại mã mới." }, { requiresVerificationCode: true });
+        if (activeCode && !activeCode.is_expired && activeCode.failed_attempts >= EMAIL_VERIFICATION_MAX_ATTEMPTS) {
+            await transaction.rollback();
+            return attemptsExceeded();
+        }
+
+        const matchedResult = await new sql.Request(transaction)
+            .input("userId", sql.UniqueIdentifier, userId)
+            .input("tokenHash", sql.VarChar(150), codeHash)
+            .query(`
+                SELECT TOP 1
+                    t.id AS token_id,
+                    t.user_id,
+                    t.email AS token_email,
+                    t.used_at,
+                    t.revoked_at,
+                    t.delivery_status,
+                    CASE WHEN t.expires_at <= SYSDATETIME() THEN 1 ELSE 0 END AS is_expired,
+                    u.id,
+                    u.email,
+                    u.personal_email,
+                    u.full_name,
+                    u.display_name,
+                    u.phone_number,
+                    u.avatar_url,
+                    u.role,
+                    u.status,
+                    u.email_verified_at,
+                    u.last_login_at,
+                    u.must_change_password
+                FROM dbo.email_verification_tokens t WITH (UPDLOCK, HOLDLOCK)
+                INNER JOIN dbo.users u WITH (UPDLOCK, HOLDLOCK) ON u.id = t.user_id
+                WHERE t.user_id = @userId
+                  AND t.token_hash = @tokenHash
+                ORDER BY t.created_at DESC, t.id DESC;
+            `);
+
+        const record = matchedResult.recordset[0] || null;
+
+        if (!record) {
+            if (activeCode && !activeCode.is_expired) {
+                await new sql.Request(transaction).input("id", sql.BigInt, activeCode.id)
+                    .query("UPDATE dbo.email_verification_tokens SET failed_attempts=failed_attempts+1 WHERE id=@id;");
+                await transaction.commit();
+                transactionCommitted = true;
+                if (activeCode.failed_attempts + 1 >= EMAIL_VERIFICATION_MAX_ATTEMPTS) return attemptsExceeded();
+            } else {
+                await transaction.rollback();
+            }
+            return failure(
+                "VERIFICATION_CODE_INCORRECT",
+                "Mã xác nhận không chính xác. Vui lòng kiểm tra lại email mới nhất.",
+                { verificationCode: "Mã xác nhận không chính xác." },
+                { requiresVerificationCode: true }
+            );
+        }
+
+        if (record.role !== "CUSTOMER") {
+            await transaction.rollback();
+            return failure(
+                "VERIFICATION_NOT_ALLOWED",
+                "Tài khoản này không áp dụng xác thực khách hàng."
+            );
+        }
+
+        if (record.status === 2) {
+            await transaction.rollback();
+            return failure(
+                "ACCOUNT_INACTIVE",
+                "Tài khoản đã ngừng hoạt động hoặc đã bị thu hồi quyền truy cập."
+            );
+        }
+
+        if (record.used_at !== null) {
+            await transaction.rollback();
+            if (record.status === 1) {
+                return {
+                    success: true,
+                    alreadyVerified: true,
+                    email: record.email,
+                    user: record,
+                    message: "Tài khoản của bạn đã được kích hoạt trước đó. Lần đăng nhập tiếp theo không cần nhập mã.",
+                };
+            }
+            return failure(
+                "VERIFICATION_CODE_USED",
+                "Mã xác nhận này đã được sử dụng.",
+                { verificationCode: "Mã xác nhận đã được sử dụng." },
+                { requiresVerificationCode: true, email: record.email }
+            );
+        }
+
+        if (record.revoked_at !== null) {
+            await transaction.rollback();
+            return failure(
+                "VERIFICATION_CODE_REVOKED",
+                "Mã xác nhận này đã hết hiệu lực do có mã mới hơn được gửi. Vui lòng sử dụng mã trong email mới nhất.",
+                { verificationCode: "Mã xác nhận đã hết hiệu lực." },
+                { requiresVerificationCode: true, email: record.email }
+            );
+        }
+
+        if (record.delivery_status !== "SENT") {
+            await transaction.rollback();
+            return failure("VERIFICATION_CODE_NOT_READY", "Mã xác nhận chưa được gửi thành công. Vui lòng gửi lại mã mới.",
+                { verificationCode: "Vui lòng gửi lại mã xác nhận." }, { requiresVerificationCode: true });
+        }
+
+        if (record.is_expired === 1) {
+            await transaction.rollback();
+            return failure(
+                "VERIFICATION_CODE_EXPIRED",
+                "Mã xác nhận đã hết hạn. Vui lòng bấm 'Gửi lại mã xác nhận' để nhận mã mới.",
+                { verificationCode: "Mã xác nhận đã hết hạn." },
+                { requiresVerificationCode: true, email: record.email }
+            );
+        }
+
+        const updatedResult = await new sql.Request(transaction)
+            .input("tokenId", sql.BigInt, record.token_id)
+            .input("userId", sql.UniqueIdentifier, record.user_id)
+            .query(`
+                UPDATE dbo.email_verification_tokens
+                SET used_at = CASE WHEN SYSDATETIME() >= created_at THEN SYSDATETIME() ELSE created_at END
+                WHERE id = @tokenId
+                  AND used_at IS NULL
+                  AND revoked_at IS NULL;
+
+                UPDATE dbo.email_verification_tokens
+                SET revoked_at = CASE WHEN SYSDATETIME() >= created_at THEN SYSDATETIME() ELSE created_at END
+                WHERE user_id = @userId
+                  AND id <> @tokenId
+                  AND used_at IS NULL
+                  AND revoked_at IS NULL;
+
+                UPDATE dbo.users
+                SET status = 1,
+                    email_verified_at = COALESCE(email_verified_at, SYSDATETIME()),
+                    last_login_at = SYSDATETIME(),
+                    updated_at = SYSDATETIME()
+                OUTPUT
+                    INSERTED.id,
+                    INSERTED.email,
+                    INSERTED.personal_email,
+                    INSERTED.full_name,
+                    INSERTED.display_name,
+                    INSERTED.phone_number,
+                    INSERTED.avatar_url,
+                    INSERTED.role,
+                    INSERTED.status,
+                    INSERTED.email_verified_at,
+                    INSERTED.last_login_at,
+                    INSERTED.must_change_password
+                WHERE id = @userId
+                  AND status = 0;
+            `);
+
+        const activatedUser = updatedResult.recordset?.[0] || {
+            ...record,
+            status: 1,
+            email_verified_at: new Date(),
+            last_login_at: new Date(),
+        };
+
+        await transaction.commit();
+        transactionCommitted = true;
+
+        invalidateActorAuthCache(record.user_id);
+
+        return {
+            success: true,
+            alreadyVerified: false,
+            email: activatedUser.email,
+            fullName: activatedUser.full_name,
+            user: activatedUser,
+            message: "Kích hoạt tài khoản và đăng nhập thành công!",
+        };
+    } catch (error) {
+        if (!transactionCommitted) {
+            try {
+                await transaction.rollback();
+            } catch {
+                // Giữ lại lỗi gốc.
+            }
+        }
+        throw error;
+    }
+}
+
+async function verifyCustomerEmail(input) {
+    if (input && typeof input === "object" && !Array.isArray(input)) {
+        const email = typeof input.email === "string" ? input.email.trim().toLowerCase() : "";
+        const code = typeof input.code === "string" ? input.code.trim() : "";
+
+        if (!email || !EMAIL_REGEX.test(email)) {
+            return failure(
+                "DATA_INVALID",
+                "Vui lòng nhập email hợp lệ để xác nhận.",
+                { email: "Email không đúng định dạng." }
+            );
+        }
+
+        const pool = getDBPool();
+        const found = await pool
+            .request()
+            .input("email", sql.VarChar(255), email)
+            .query(`
+                SELECT TOP 1 id, email, role, status
+                FROM dbo.users
+                WHERE email = @email;
+            `);
+
+        const user = found.recordset[0] || null;
+        if (!user) {
+            return failure(
+                "USER_EMAIL_NOT_EXISTED",
+                "Email chưa được đăng ký trong hệ thống."
+            );
+        }
+
+        if (user.status === 1) {
+            return {
+                success: true,
+                alreadyVerified: true,
+                email: user.email,
+                message: "Tài khoản này đã được kích hoạt. Bạn có thể đăng nhập ngay.",
+            };
+        }
+
+        return activateCustomerByVerificationCode({ userId: user.id, rawCode: code });
+    }
+
+    const token = typeof input === "string" ? input.trim() : "";
 
     if (!token || !/^[a-f0-9]{64}$/i.test(token)) {
         return failure(
@@ -711,7 +1080,7 @@ async function verifyCustomerEmail(rawToken) {
             await transaction.rollback();
             return failure(
                 "VERIFICATION_TOKEN_REVOKED",
-                "Liên kết xác thực này đã hết hiệu lực do có liên kết mới hơn được gửi đi. Vui lòng kiểm tra email mới nhất.",
+                "Liên kết xác thực này đã hết hiệu lực do có mã mới hơn được gửi.",
                 {},
                 { email: record.user_email }
             );
@@ -721,31 +1090,10 @@ async function verifyCustomerEmail(rawToken) {
             await transaction.rollback();
             return failure(
                 "VERIFICATION_TOKEN_EXPIRED",
-                "Liên kết xác thực đã hết hạn. Vui lòng yêu cầu gửi lại email xác thực mới.",
+                "Liên kết xác thực đã hết hạn. Vui lòng yêu cầu gửi lại mã xác nhận mới.",
                 {},
                 { email: record.user_email }
             );
-        }
-
-        if (record.status === 1 && record.email_verified_at !== null) {
-            await new sql.Request(transaction)
-                .input("tokenId", sql.BigInt, record.token_id)
-                .query(`
-                    UPDATE dbo.email_verification_tokens
-                    SET used_at = CASE WHEN SYSDATETIME() >= created_at THEN SYSDATETIME() ELSE created_at END
-                    WHERE id = @tokenId
-                      AND used_at IS NULL
-                      AND revoked_at IS NULL;
-                `);
-            await transaction.commit();
-            transactionCommitted = true;
-
-            return {
-                success: true,
-                alreadyVerified: true,
-                email: record.user_email,
-                message: "Email của bạn đã được xác thực trước đó. Bạn có thể đăng nhập ngay.",
-            };
         }
 
         await new sql.Request(transaction)
@@ -755,13 +1103,6 @@ async function verifyCustomerEmail(rawToken) {
                 UPDATE dbo.email_verification_tokens
                 SET used_at = CASE WHEN SYSDATETIME() >= created_at THEN SYSDATETIME() ELSE created_at END
                 WHERE id = @tokenId
-                  AND used_at IS NULL
-                  AND revoked_at IS NULL;
-
-                UPDATE dbo.email_verification_tokens
-                SET revoked_at = CASE WHEN SYSDATETIME() >= created_at THEN SYSDATETIME() ELSE created_at END
-                WHERE user_id = @userId
-                  AND id <> @tokenId
                   AND used_at IS NULL
                   AND revoked_at IS NULL;
 
@@ -781,7 +1122,7 @@ async function verifyCustomerEmail(rawToken) {
             alreadyVerified: false,
             email: record.user_email,
             fullName: record.full_name,
-            message: "Xác thực email thành công! Tài khoản của bạn đã được kích hoạt, bạn có thể đăng nhập ngay bây giờ.",
+            message: "Xác thực email thành công! Bạn có thể đăng nhập ngay bây giờ.",
         };
     } catch (error) {
         if (!transactionCommitted) {
@@ -815,7 +1156,7 @@ async function resendCustomerVerificationEmail(body) {
     const transaction = new sql.Transaction(getDBPool());
     let transactionCommitted = false;
     let user = null;
-    let rawToken = null;
+    let verification = null;
 
     try {
         await transaction.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
@@ -842,7 +1183,7 @@ async function resendCustomerVerificationEmail(body) {
             await transaction.rollback();
             return failure(
                 "VERIFICATION_NOT_ALLOWED",
-                "Tài khoản này không hỗ trợ gửi lại email xác thực khách hàng."
+                "Tài khoản này không hỗ trợ gửi lại mã xác nhận khách hàng."
             );
         }
 
@@ -858,40 +1199,17 @@ async function resendCustomerVerificationEmail(body) {
             await transaction.rollback();
             return failure(
                 "EMAIL_ALREADY_VERIFIED",
-                "Email này đã được xác thực. Bạn có thể đăng nhập ngay."
+                "Tài khoản này đã được kích hoạt trước đó. Bạn có thể đăng nhập mà không cần mã xác nhận."
             );
         }
 
-        const cooldownResult = await new sql.Request(transaction)
-            .input("userId", sql.UniqueIdentifier, user.id)
-            .query(`
-                SELECT TOP 1
-                    DATEDIFF(second, created_at, SYSDATETIME()) AS seconds_since_last
-                FROM dbo.email_verification_tokens WITH (HOLDLOCK)
-                WHERE user_id = @userId
-                ORDER BY created_at DESC, id DESC;
-            `);
-
-        const lastSeconds = cooldownResult.recordset[0]?.seconds_since_last;
-        if (
-            typeof lastSeconds === "number" &&
-            lastSeconds >= 0 &&
-            lastSeconds < EMAIL_VERIFICATION_RESEND_COOLDOWN_SECONDS
-        ) {
-            const retryAfterSeconds = Math.max(
-                1,
-                EMAIL_VERIFICATION_RESEND_COOLDOWN_SECONDS - lastSeconds
-            );
+        const retryAfterSeconds = await verificationRetryAfter(transaction, user.id);
+        if (retryAfterSeconds > 0) {
             await transaction.rollback();
-            return failure(
-                "VERIFICATION_RESEND_TOO_FREQUENT",
-                `Vui lòng đợi ${retryAfterSeconds} giây trước khi yêu cầu gửi lại email xác thực.`,
-                {},
-                { retryAfterSeconds }
-            );
+            return verificationCooldownFailure(retryAfterSeconds);
         }
 
-        rawToken = await issueCustomerVerificationToken(transaction, user.id, user.email);
+        verification = await issueCustomerVerificationCode(transaction, user.id, user.email);
 
         await transaction.commit();
         transactionCommitted = true;
@@ -906,18 +1224,12 @@ async function resendCustomerVerificationEmail(body) {
         throw error;
     }
 
-    const verificationUrl = buildCustomerVerificationUrl(rawToken);
-    const mailResult = await mailService.sendCustomerVerificationEmail({
-        toEmail: user.email,
-        fullName: user.full_name,
-        verificationUrl,
-        expiresInHours: EMAIL_VERIFICATION_TTL_HOURS,
-    });
+    const mailResult = await deliverCustomerVerification(user, verification);
 
     if (!mailResult?.success) {
         return failure(
             "EMAIL_DELIVERY_FAILED",
-            "Không thể gửi email xác thực lúc này. Vui lòng kiểm tra lại sau."
+            "Không thể gửi mã xác nhận qua email lúc này. Vui lòng thử lại sau."
         );
     }
 
@@ -926,7 +1238,126 @@ async function resendCustomerVerificationEmail(body) {
         email: user.email,
         expiresInHours: EMAIL_VERIFICATION_TTL_HOURS,
         cooldownSeconds: EMAIL_VERIFICATION_RESEND_COOLDOWN_SECONDS,
-        message: "Đã gửi lại email xác thực. Vui lòng kiểm tra hộp thư đến hoặc thư rác.",
+        message: "Đã gửi lại mã xác nhận mới về email của bạn. Vui lòng kiểm tra hộp thư.",
+    };
+}
+
+async function forgotCustomerPassword(body) {
+    if (!isValidBody(body)) {
+        return failure("DATA_INVALID", "Request body không hợp lệ.");
+    }
+
+    const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+    if (!email) {
+        return failure("DATA_INVALID", "Vui lòng nhập email đã đăng ký.", {
+            email: "Vui lòng nhập email đã đăng ký.",
+        });
+    }
+    if (email.length > 255 || !EMAIL_REGEX.test(email)) {
+        return failure("DATA_INVALID", "Email không đúng định dạng.", {
+            email: "Email không đúng định dạng.",
+        });
+    }
+
+    const pool = getDBPool();
+    const found = await pool
+        .request()
+        .input("email", sql.VarChar(255), email)
+        .query(`
+            SELECT TOP 1 id, email, full_name, role, status
+            FROM dbo.users
+            WHERE email = @email;
+        `);
+
+    const user = found.recordset[0] || null;
+    if (!user) {
+        return failure(
+            "USER_EMAIL_NOT_EXISTED",
+            "Email chưa được đăng ký trong hệ thống.",
+            { email: "Email chưa được đăng ký trong hệ thống." }
+        );
+    }
+
+    if (user.role !== "CUSTOMER") {
+        return failure(
+            "FORGOT_PASSWORD_NOT_ALLOWED",
+            "Tài khoản này không hỗ trợ cấp lại mật khẩu tại cổng khách hàng."
+        );
+    }
+
+    if (user.status === 2) {
+        return failure(
+            "ACCOUNT_INACTIVE",
+            "Tài khoản đã ngừng hoạt động hoặc đã bị thu hồi quyền truy cập."
+        );
+    }
+
+    const now = Date.now();
+    for (const [k, expiresAt] of forgotPasswordCooldowns.entries()) {
+        if (expiresAt <= now) {
+            forgotPasswordCooldowns.delete(k);
+        }
+    }
+
+    const cooldownUntil = forgotPasswordCooldowns.get(user.id);
+    if (cooldownUntil && cooldownUntil > now) {
+        const retryAfterSeconds = Math.max(1, Math.ceil((cooldownUntil - now) / 1000));
+        return failure(
+            "FORGOT_PASSWORD_TOO_FREQUENT",
+            `Vui lòng đợi ${retryAfterSeconds} giây trước khi yêu cầu gửi mật khẩu mới tiếp theo.`,
+            {},
+            { retryAfterSeconds }
+        );
+    }
+
+    forgotPasswordCooldowns.set(user.id, now + FORGOT_PASSWORD_COOLDOWN_SECONDS * 1000);
+
+    const newPassword = generateTemporaryPassword(10);
+    const passwordHash = await bcrypt.hash(newPassword, 12);
+
+    let mailResult;
+    try {
+        mailResult = await mailService.sendCustomerNewPasswordEmail({
+            toEmail: user.email,
+            fullName: user.full_name,
+            newPassword,
+        });
+    } catch (error) {
+        forgotPasswordCooldowns.delete(user.id);
+        return failure("EMAIL_DELIVERY_FAILED", "Không thể gửi mật khẩu mới về email lúc này. Vui lòng thử lại sau.");
+    }
+
+    if (!mailResult?.success) {
+        forgotPasswordCooldowns.delete(user.id);
+        return failure(
+            "EMAIL_DELIVERY_FAILED",
+            "Không thể gửi mật khẩu mới về email lúc này. Vui lòng kiểm tra cấu hình hoặc thử lại sau."
+        );
+    }
+
+    await pool
+        .request()
+        .input("id", sql.UniqueIdentifier, user.id)
+        .input("passwordHash", sql.VarChar(255), passwordHash)
+        .query(`
+            UPDATE dbo.users
+            SET password_hash = @passwordHash,
+                password_change_at = SYSDATETIME(),
+                updated_at = SYSDATETIME()
+            WHERE id = @id
+              AND role = 'CUSTOMER'
+              AND status IN (0, 1);
+        `);
+
+    invalidateActorAuthCache(user.id);
+
+    return {
+        success: true,
+        email: user.email,
+        cooldownSeconds: FORGOT_PASSWORD_COOLDOWN_SECONDS,
+        requiresVerificationCode: user.status === 0,
+        message: `Mật khẩu mới đã được gửi về email ${user.email}. Vui lòng kiểm tra hộp thư của bạn.` +
+            (user.status === 0 ? " Tài khoản chưa kích hoạt: lần đăng nhập đầu tiên vẫn cần mã xác nhận 6 chữ số. Bạn có thể gửi lại mã tại trang đăng nhập." : ""),
     };
 }
 
@@ -1247,10 +1678,12 @@ async function changeCustomerPassword(userId, body) {
 
 
 module.exports = {
+    validateCustomerLoginInput,
     login,
     register,
     verifyCustomerEmail,
     resendCustomerVerificationEmail,
+    forgotCustomerPassword,
     logout,
     getAdminUserById,
     changeInitialPassword,

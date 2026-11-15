@@ -2540,20 +2540,13 @@ async function claimGuestConversationsToCustomer(customerActor, guestSessionId) 
     for (const gConv of guestConvs) {
       const gCid = Number(gConv.id);
 
-      // If Customer only has an idle AI shell and Guest was already WAITING_HUMAN / HUMAN, keep Guest's live handoff
+      // If Customer only has an idle AI shell and Guest was already WAITING_HUMAN / HUMAN, carry history and keep Guest's live handoff
       if (targetCid && targetMode === "AI" && gConv.handlingMode !== "AI") {
-        await lockConversationsInOrder(tx, [Math.min(gCid, targetCid), Math.max(gCid, targetCid)]);
-        await newRequest(tx)
-          .input("tCid", sqlObj.BigInt, targetCid)
-          .query(`
-            UPDATE dbo.chat_conversations
-            SET status = 'RESOLVED',
-                resolved_at = SYSUTCDATETIME(),
-                ai_due_at = NULL,
-                control_revision = control_revision + 1,
-                updated_at = SYSUTCDATETIME()
-            WHERE id = @tCid AND status = 'OPEN';
-          `);
+        await syncMessagesFromSourceConversationsTx(tx, {
+          targetCid: gCid,
+          sourceCids: [targetCid],
+          resolveSources: true,
+        });
         targetCid = null;
         targetMode = null;
       }
