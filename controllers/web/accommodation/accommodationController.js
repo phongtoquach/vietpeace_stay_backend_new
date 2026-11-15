@@ -16,6 +16,7 @@ async function searchAccommodations(req, res) {
         const filters = {
             locationId: body.locationId,
             accommodationId: body.accommodationId,
+            onlyFeatured: body.onlyFeatured,
 
             accommodationType: body.accommodationType,
             //accommodationTypeId: body.accommodationTypeId,

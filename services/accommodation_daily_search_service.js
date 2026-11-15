@@ -178,6 +178,8 @@ function normalizeFilters(filters) {
 			errors
 		),
 
+		onlyFeatured: 0,
+
 		accommodationTypeIds: parseIdList(filters.accommodationTypeIds, "accommodationTypeIds", errors),
 
 		accommodationType: null,
@@ -226,6 +228,16 @@ function normalizeFilters(filters) {
 		),
 	};
 
+	// check onlyFeatured
+	if (!isMissing(filters.onlyFeatured)) {
+		if ([0, 1, "0", "1"].includes(filters.onlyFeatured)) {
+			normalized.onlyFeatured = Number(filters.onlyFeatured);
+		} else {
+			errors.onlyFeatured = "onlyFeatured phải có giá trị 0 hoặc 1.";
+		}
+	}
+
+	// check accommodationType
 	if (!isMissing(filters.accommodationType)) {
 		if (typeof filters.accommodationType !== "string") {
 			errors.accommodationType = "accommodationType phải là chuỗi.";
@@ -404,6 +416,9 @@ async function searchAccommodationsByFilters(filters = {}, sort = "default", pag
 	const hasDates = filters.checkinDate !== null;
 	const hasAccommodationId = filters.accommodationId !== null;
 
+	const hasLocationId = filters.locationId !== null;
+	const requiresActiveLocation = hasLocationId || !hasAccommodationId;
+
 	// Tìm đích danh accommodation: không loại vì thiếu phòng.
 	const onlyAvailable = hasDates && !hasAccommodationId;
 
@@ -412,14 +427,27 @@ async function searchAccommodationsByFilters(filters = {}, sort = "default", pag
 		"a.deleted_at IS NULL",
 	];
 
-	if (filters.locationId !== null) {
-		conditions.push(`
-		a.location_id IN (
-			SELECT id
-			FROM LocationTree
-		)
-		`);
+	// if (filters.locationId !== null) {
+	// 	conditions.push(`
+	// 	a.location_id IN (
+	// 		SELECT id
+	// 		FROM LocationTree
+	// 	)
+	// 	`);
+	// }
+
+	// check hasLocationId
+	if (hasLocationId) {
+		conditions.push("a.location_id IN (SELECT id FROM LocationTree)");
+	} else if (requiresActiveLocation) {
+		conditions.push("a.location_id IN (SELECT id FROM ActiveLocations)");
 	}
+
+	// check onlyFeatured
+	if (filters.onlyFeatured === 1) {
+		conditions.push("a.is_featured = 1");
+	}
+
 
 	if (hasAccommodationId) {
 		conditions.push("a.id = @accommodationId");
@@ -473,21 +501,58 @@ async function searchAccommodationsByFilters(filters = {}, sort = "default", pag
 		`);
 	}
 
-	const locationCte = filters.locationId !== null
+	// const locationCte = filters.locationId !== null
+	// 	? `
+	// 	LocationTree AS (
+	// 		SELECT id
+	// 		FROM dbo.locations
+	// 		WHERE id = @locationId
+
+	// 		UNION ALL
+
+	// 		SELECT child.id
+	// 		FROM dbo.locations AS child
+	// 		INNER JOIN LocationTree AS parent
+	// 			ON child.parent_id = parent.id
+	// 	),
+	// 	` : "";
+
+	// Query lay active locations tree
+	const activeLocationsCte = requiresActiveLocation
+		? `
+		ActiveLocations AS (
+			SELECT id
+			FROM dbo.locations
+			WHERE parent_id IS NULL
+				AND is_active = 1
+
+			UNION ALL
+
+			SELECT child.id
+			FROM dbo.locations AS child
+			INNER JOIN ActiveLocations AS parent ON parent.id = child.parent_id
+			WHERE child.is_active = 1
+		),
+		`
+		: "";
+
+	const locationTreeCte = hasLocationId
 		? `
 		LocationTree AS (
 			SELECT id
-			FROM dbo.locations
+			FROM ActiveLocations
 			WHERE id = @locationId
 
 			UNION ALL
 
 			SELECT child.id
 			FROM dbo.locations AS child
-			INNER JOIN LocationTree AS parent
-				ON child.parent_id = parent.id
+			INNER JOIN LocationTree AS parent ON parent.id = child.parent_id
+			WHERE child.is_active = 1
 		),
-		` : "";
+		`
+		: "";
+
 
 	// Có ngày: tính giá trung bình từng đêm và min tồn bán được theo từng hạng phòng từ fn_room_daily_offer.
 	const inventoryCtes = hasDates
@@ -561,7 +626,8 @@ async function searchAccommodationsByFilters(filters = {}, sort = "default", pag
 		}
 
 		;WITH
-		${locationCte}
+		${activeLocationsCte}
+		${locationTreeCte}
 
 		CandidateAccommodations AS (
 			SELECT
