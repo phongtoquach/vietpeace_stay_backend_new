@@ -54,6 +54,7 @@ async function getDashboardSummary(currentUser = {}) {
        FROM dbo.bookings b
        JOIN dbo.accommodations a ON a.id = b.accommodation_id
        WHERE ${scope.condition}
+         AND b.status = 'CONFIRMED'
          AND b.checked_in_at IS NOT NULL
          AND b.checked_out_at IS NULL
          AND b.check_out_date = CAST(SYSDATETIME() AS DATE)) AS checkouts_today,
@@ -74,6 +75,7 @@ async function getDashboardSummary(currentUser = {}) {
        JOIN dbo.bookings b ON b.id = i.booking_id
        JOIN dbo.accommodations a ON a.id = b.accommodation_id
        WHERE ${scope.condition}
+         AND b.status = 'CONFIRMED'
          AND b.checked_in_at IS NOT NULL
          AND b.checked_out_at IS NULL) AS occupied_rooms,
       (SELECT ISNULL(SUM(rt.quantity), 0)

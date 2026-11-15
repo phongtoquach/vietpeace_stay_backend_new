@@ -283,7 +283,12 @@ async function getBookingList(query = {}, currentUser = {}) {
       room_type_names.names AS room_type_names
     FROM dbo.bookings b
     JOIN dbo.accommodations a ON a.id = b.accommodation_id
-    LEFT JOIN dbo.accommodation_managers am ON am.accommodation_id = a.id
+    OUTER APPLY (
+      SELECT TOP 1 am.user_id
+      FROM dbo.accommodation_managers am
+      WHERE am.accommodation_id = a.id
+      ORDER BY am.assigned_at DESC, am.user_id ASC
+    ) am
     LEFT JOIN dbo.users manager ON manager.id = am.user_id
     OUTER APPLY (
       SELECT STRING_AGG(rt.name, ', ') AS names
@@ -446,7 +451,12 @@ async function getBookingDetail(bookingId, currentUser = {}) {
       a.check_out_time AS accommodation_check_out_time
     FROM dbo.bookings b
     JOIN dbo.accommodations a ON a.id = b.accommodation_id
-    LEFT JOIN dbo.accommodation_managers am ON am.accommodation_id = a.id
+    OUTER APPLY (
+      SELECT TOP 1 am.user_id
+      FROM dbo.accommodation_managers am
+      WHERE am.accommodation_id = a.id
+      ORDER BY am.assigned_at DESC, am.user_id ASC
+    ) am
     LEFT JOIN dbo.users manager ON manager.id = am.user_id
     LEFT JOIN dbo.users checkedInBy ON checkedInBy.id = b.checked_in_by
     LEFT JOIN dbo.users checkedOutBy ON checkedOutBy.id = b.checked_out_by
@@ -719,6 +729,14 @@ async function checkOutBooking(bookingId, currentUser = {}) {
     );
   }
 
+  if (current.status !== "CONFIRMED") {
+    throw new BookingAdminServiceError(
+      409,
+      ERROR_CODES.INVALID_STATE,
+      "Chỉ booking đã xác nhận mới được phép trả phòng.",
+    );
+  }
+
   if (current.checked_out_at) {
     throw new BookingAdminServiceError(
       409,
@@ -751,6 +769,7 @@ async function checkOutBooking(bookingId, currentUser = {}) {
     FROM dbo.bookings b
     JOIN dbo.accommodations a ON a.id = b.accommodation_id
     WHERE b.id = @bookingId
+      AND b.status = 'CONFIRMED'
       AND b.checked_in_at IS NOT NULL
       AND b.checked_out_at IS NULL
       AND ${scope.condition};
