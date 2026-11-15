@@ -27,7 +27,7 @@ async function getAllLocationsAndAccommodations() {
         SELECT a.id, a.location_id, a.accommodation_name
         FROM dbo.accommodations AS a
         INNER JOIN dbo.locations AS l ON l.id = a.location_id
-        WHERE a.status = 1 AND a.deleted_at IS NULL
+        WHERE a.status = 1 AND a.deleted_at IS NULL AND l.is_active = 1
         ORDER BY a.id ASC;
     `);
 
