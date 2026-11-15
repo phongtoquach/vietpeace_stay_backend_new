@@ -73,6 +73,14 @@ const locationRoutes = require("./location_web_routes");
 router.use("/locations", locationRoutes);
 
 
+/**
+ * [PUBLIC APIS] Các API về amenity
+ * 
+*/
+const amenityWebRoutes = require("./amenity_web_routes");
+router.use("/amenities", amenityWebRoutes);
+
+
 
 /**
  * [PUBLIC APIS] Các API để test 
