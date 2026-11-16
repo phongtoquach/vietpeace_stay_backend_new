@@ -31,6 +31,17 @@ const DIRECT_SETTLEMENT_METHODS = Object.freeze([
   "POS_CARD",
 ]);
 
+const MANAGER_DIRECT_ADJUSTMENT_MAX_VND = 500000;
+const MANAGER_DIRECT_ADJUSTMENT_MAX_PCT = 15;
+
+function getManagerDirectAdjustmentCap(grossBeforeDiscount) {
+  const gross = Math.max(0, Math.round(Number(grossBeforeDiscount || 0)));
+  return Math.min(
+    MANAGER_DIRECT_ADJUSTMENT_MAX_VND,
+    Math.round((gross * MANAGER_DIRECT_ADJUSTMENT_MAX_PCT) / 100),
+  );
+}
+
 class CheckoutSettlementError extends Error {
   constructor(statusCode, errorCode, message, errors = undefined) {
     super(message);
@@ -330,6 +341,89 @@ function mapSettlementPaymentRow(row) {
   };
 }
 
+function parseEvidenceImagesJson(rawJson) {
+  if (!rawJson) return [];
+  try {
+    const parsed = JSON.parse(rawJson);
+    return Array.isArray(parsed)
+      ? parsed.filter((u) => typeof u === "string" && u.trim())
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function mapNegotiationRow(row) {
+  return {
+    id: Number(row.id),
+    negotiationCode: row.negotiation_code,
+    chargeId: Number(row.charge_id),
+    bookingId: Number(row.booking_id),
+    bookingCode: row.booking_code || null,
+    accommodationId: Number(row.accommodation_id),
+    accommodationName: row.accommodation_name || null,
+    customerName: row.contact_name || null,
+    customerPhone: row.contact_phone || null,
+    itemName: row.item_name,
+    quantity: Number(row.quantity),
+    unitPrice: Number(row.unit_price || 0),
+    compensationMode: row.compensation_mode,
+    depreciationPercent: Number(row.depreciation_percent ?? 100),
+    originalGrossAmount: Number(row.original_gross_amount || 0),
+    previousAdjustmentAmount: Number(row.previous_adjustment_amount || 0),
+    previousFinalAmount: Number(row.previous_final_amount || 0),
+    requestedExtraReduction: Number(row.requested_extra_reduction || 0),
+    proposedFinalAmount: Number(row.proposed_final_amount || 0),
+    guestOpinion: row.guest_opinion,
+    managerNote: row.manager_note || null,
+    evidenceImages: parseEvidenceImagesJson(row.evidence_images_json),
+    isUrgent: Boolean(row.is_urgent),
+    status: row.status,
+    approvedExtraReduction:
+      row.approved_extra_reduction === null || row.approved_extra_reduction === undefined
+        ? null
+        : Number(row.approved_extra_reduction),
+    finalApprovedAmount:
+      row.final_approved_amount === null || row.final_approved_amount === undefined
+        ? null
+        : Number(row.final_approved_amount),
+    adminDecisionNote: row.admin_decision_note || null,
+    requestedBy: row.requested_by || null,
+    requestedByName: row.requested_by_name || null,
+    reviewedBy: row.reviewed_by || null,
+    reviewedByName: row.reviewed_by_name || null,
+    reviewedAt: toIsoString(row.reviewed_at),
+    managerAckAt: toIsoString(row.manager_ack_at),
+    createdAt: toIsoString(row.created_at),
+    updatedAt: toIsoString(row.updated_at),
+    versionToken: row.version_token || null,
+  };
+}
+
+async function fetchNegotiationsForBooking(executor, bookingId) {
+  const res = await new sql.Request(executor)
+    .input("bookingId", sql.BigInt, bookingId)
+    .query(`
+      SELECT
+        n.*,
+        CONVERT(VARCHAR(18), n.version, 1) AS version_token,
+        b.booking_code,
+        b.contact_name,
+        b.contact_phone,
+        a.accommodation_name,
+        ru.full_name AS requested_by_name,
+        vu.full_name AS reviewed_by_name
+      FROM dbo.compensation_negotiations n
+      JOIN dbo.bookings b ON b.id = n.booking_id
+      JOIN dbo.accommodations a ON a.id = n.accommodation_id
+      LEFT JOIN dbo.users ru ON ru.id = n.requested_by
+      LEFT JOIN dbo.users vu ON vu.id = n.reviewed_by
+      WHERE n.booking_id = @bookingId
+      ORDER BY n.created_at DESC, n.id DESC;
+    `);
+  return res.recordset.map(mapNegotiationRow);
+}
+
 async function fetchPrepaidSummary(executor, bookingId) {
   const res = await new sql.Request(executor)
     .input("bookingId", sql.BigInt, bookingId)
@@ -429,7 +523,7 @@ async function buildFolioResponseFromParts({
 }) {
   const bookingId = Number(bookingRow.id);
 
-  const [itemsRes, prepaidInfo, charges, invoiceRow, settlementPayments] =
+  const [itemsRes, prepaidInfo, charges, invoiceRow, settlementPayments, negotiations] =
     await Promise.all([
       new sql.Request(executor)
         .input("bookingId", sql.BigInt, bookingId)
@@ -453,6 +547,7 @@ async function buildFolioResponseFromParts({
       fetchChargesForBooking(executor, bookingId, { includeVoided }),
       fetchInvoiceRow(executor, bookingId),
       fetchSettlementPayments(executor, bookingId),
+      fetchNegotiationsForBooking(executor, bookingId),
     ]);
 
   const activeCharges = charges.filter((c) => c.status === "ACTIVE");
@@ -508,6 +603,11 @@ async function buildFolioResponseFromParts({
 
   const settledPayment =
     settlementPayments.find((p) => p.status === "SUCCESS") || null;
+
+  const pendingNegotiationsCount = negotiations.filter((n) => n.status === "PENDING").length;
+  const unacknowledgedDecisionsCount = negotiations.filter(
+    (n) => ["APPROVED", "PARTIALLY_APPROVED", "REJECTED"].includes(n.status) && !n.managerAckAt,
+  ).length;
 
   return {
     booking: {
@@ -591,10 +691,18 @@ async function buildFolioResponseFromParts({
         },
     settlementPayments,
     settledPayment,
+    negotiations,
+    pendingNegotiationsCount,
+    unacknowledgedDecisionsCount,
     vietQr,
     permissions: {
       canModifyCharges,
-      canSettle,
+      canSettle: canSettle && pendingNegotiationsCount === 0,
+      hasPendingNegotiation: pendingNegotiationsCount > 0,
+      managerDirectAdjustmentLimit: {
+        maxAmountVnd: MANAGER_DIRECT_ADJUSTMENT_MAX_VND,
+        maxPercent: MANAGER_DIRECT_ADJUSTMENT_MAX_PCT,
+      },
     },
   };
 }
@@ -735,6 +843,69 @@ async function runInTransaction(pool, work) {
   }
 }
 
+function assertManagerDirectAdjustmentWithinCap(calc, currentUser) {
+  if (calc.category !== "DAMAGE_COMPENSATION") return;
+  if (currentUser?.role === "ADMIN") return;
+  if (calc.adjustmentAmount <= 0) return;
+
+  const grossBeforeDiscount = calc.subtotalAmount + calc.adjustmentAmount;
+  const cap = getManagerDirectAdjustmentCap(grossBeforeDiscount);
+  if (calc.adjustmentAmount > cap) {
+    throw validationError(
+      `Giảm trừ trực tiếp tại quầy vượt quá hạn mức tự quyết của Quản lý cơ sở (tối đa ${cap.toLocaleString("vi-VN")} đ — không quá 500.000 đ và ${MANAGER_DIRECT_ADJUSTMENT_MAX_PCT}% giá trị bồi thường). Vui lòng ghi nhận khoản bồi thường và gửi Phiếu thương lượng lên Admin duyệt.`,
+      {
+        adjustmentAmount: `Hạn mức Quản lý tối đa ${cap.toLocaleString("vi-VN")} đ; mức giảm cao hơn cần gửi Admin phê duyệt.`,
+      },
+    );
+  }
+}
+
+async function fetchChargeNegotiationLockState(tx, chargeId) {
+  const negRes = await new sql.Request(tx)
+    .input("chargeId", sql.BigInt, chargeId)
+    .query(`
+      SELECT status
+      FROM dbo.compensation_negotiations WITH (UPDLOCK, HOLDLOCK)
+      WHERE charge_id = @chargeId;
+    `);
+  const statuses = negRes.recordset.map((r) => r.status);
+  if (statuses.includes("PENDING")) {
+    throw invalidStateError(
+      "Khoản bồi thường này đang có phiếu thương lượng chờ Admin phê duyệt. Vui lòng đợi Admin phản hồi hoặc hủy phiếu thương lượng trước.",
+    );
+  }
+  return {
+    hasAdminRuling: statuses.some((s) =>
+      ["APPROVED", "PARTIALLY_APPROVED", "REJECTED"].includes(s),
+    ),
+  };
+}
+
+async function assertChargeCanBeVoided(tx, chargeId, currentUser) {
+  const { hasAdminRuling } = await fetchChargeNegotiationLockState(tx, chargeId);
+  if (hasAdminRuling && currentUser?.role !== "ADMIN") {
+    throw invalidStateError(
+      "Khoản bồi thường này đã được Admin thẩm định kết quả thương lượng, Quản lý cơ sở không được tự ý hủy.",
+    );
+  }
+}
+
+async function assertNoPendingNegotiationOnBooking(tx, bookingId) {
+  const res = await new sql.Request(tx)
+    .input("bookingId", sql.BigInt, bookingId)
+    .query(`
+      SELECT COUNT(*) AS cnt
+      FROM dbo.compensation_negotiations WITH (UPDLOCK, HOLDLOCK)
+      WHERE booking_id = @bookingId
+        AND status = 'PENDING';
+    `);
+  if (Number(res.recordset[0]?.cnt || 0) > 0) {
+    throw invalidStateError(
+      "Đơn đặt phòng đang có phiếu đề xuất thương lượng bồi thường chờ Admin xác nhận. Vui lòng đợi Admin phản hồi hoặc hủy đề xuất trước khi kết toán.",
+    );
+  }
+}
+
 async function addIncidentalCharge(bookingId, payload = {}, currentUser = {}) {
   const id = parsePositiveInt(bookingId);
   if (!id) {
@@ -847,6 +1018,8 @@ async function addIncidentalCharge(bookingId, payload = {}, currentUser = {}) {
       throw validationError("Nếu áp dụng phí vệ sinh đặc biệt thì số tiền phải lớn hơn 0 đ. Nếu phòng sạch sẽ, không cần thêm mục này.");
     }
 
+    assertManagerDirectAdjustmentWithinCap(calc, currentUser);
+
     const evidenceImageUrl = payload.evidenceImageUrl
       ? String(payload.evidenceImageUrl).trim().slice(0, 500)
       : null;
@@ -923,6 +1096,8 @@ async function updateIncidentalCharge(bookingId, chargeId, payload = {}, current
       throw invalidStateError("Không thể chỉnh sửa khoản phát sinh đã hủy.");
     }
 
+    const { hasAdminRuling } = await fetchChargeNegotiationLockState(tx, cId);
+
     const nextItemName = payload.itemName !== undefined
       ? String(payload.itemName || "").trim()
       : existing.item_name;
@@ -945,6 +1120,21 @@ async function updateIncidentalCharge(bookingId, chargeId, payload = {}, current
       });
     }
 
+    if (hasAdminRuling && currentUser?.role !== "ADMIN") {
+      const requestedFinChange =
+        (payload.quantity !== undefined && Number(payload.quantity) !== Number(existing.quantity)) ||
+        (payload.unitPrice !== undefined && Number(payload.unitPrice) !== Number(existing.unit_price)) ||
+        (payload.compensationMode !== undefined && String(payload.compensationMode).trim().toUpperCase() !== existing.compensation_mode) ||
+        (payload.depreciationPercent !== undefined && Number(payload.depreciationPercent) !== Number(existing.depreciation_percent)) ||
+        (payload.adjustmentAmount !== undefined && Number(payload.adjustmentAmount) !== Number(existing.adjustment_amount)) ||
+        nextItemName !== existing.item_name;
+      if (requestedFinChange) {
+        throw invalidStateError(
+          "Khoản bồi thường này đã có quyết định thẩm định từ Admin, Quản lý không thể tự ý chỉnh sửa giá trị đền.",
+        );
+      }
+    }
+
     const calc = calculateChargeAmounts({
       category: existing.category,
       quantity: payload.quantity !== undefined ? payload.quantity : existing.quantity,
@@ -955,6 +1145,8 @@ async function updateIncidentalCharge(bookingId, chargeId, payload = {}, current
       taxRate: payload.taxRate !== undefined ? payload.taxRate : existing.tax_rate,
       isTaxInclusive: payload.isTaxInclusive !== undefined ? payload.isTaxInclusive : existing.is_tax_inclusive,
     });
+
+    assertManagerDirectAdjustmentWithinCap(calc, currentUser);
 
     const nextEvidence = payload.evidenceImageUrl !== undefined
       ? (payload.evidenceImageUrl ? String(payload.evidenceImageUrl).trim().slice(0, 500) : null)
@@ -1031,6 +1223,8 @@ async function voidIncidentalCharge(bookingId, chargeId, currentUser = {}) {
     if (existing.status !== "ACTIVE") {
       throw invalidStateError("Khoản phát sinh này đã được hủy trước đó.");
     }
+
+    await assertChargeCanBeVoided(tx, cId, currentUser);
 
     await cancelPendingOnlineSettlementsInTx(tx, bId);
 
@@ -1194,6 +1388,8 @@ async function settleCheckout(bookingId, payload = {}, currentUser = {}) {
       throw invalidStateError("Đơn đặt phòng đã kết toán và trả phòng trước đó.");
     }
 
+    await assertNoPendingNegotiationOnBooking(tx, id);
+
     const prepaidInfo = await fetchPrepaidSummary(tx, id);
     const activeCharges = await fetchChargesForBooking(tx, id, { includeVoided: false });
 
@@ -1327,6 +1523,8 @@ async function createVnpaySettlementSession(bookingId, payload = {}, ipAddress =
       throw invalidStateError("Đơn đặt phòng đã hoàn tất trả phòng trước đó.");
     }
 
+    await assertNoPendingNegotiationOnBooking(tx, id);
+
     const prepaidInfo = await fetchPrepaidSummary(tx, id);
     const activeCharges = await fetchChargesForBooking(tx, id, { includeVoided: false });
 
@@ -1408,8 +1606,11 @@ module.exports = {
   CHARGE_CATEGORIES,
   COMPENSATION_MODES,
   DIRECT_SETTLEMENT_METHODS,
+  MANAGER_DIRECT_ADJUSTMENT_MAX_VND,
+  MANAGER_DIRECT_ADJUSTMENT_MAX_PCT,
   CheckoutSettlementError,
   getSuggestedDepreciationPercent,
+  getManagerDirectAdjustmentCap,
   calculateChargeAmounts,
   computeFolioSummary,
   getCheckoutFolio,
@@ -1422,6 +1623,15 @@ module.exports = {
   fetchChargesForBooking,
   fetchInvoiceRow,
   fetchSettlementPayments,
+  fetchNegotiationsForBooking,
+  fetchBookingCoreFixedSql,
+  assertStayEditableForCharges,
+  cancelPendingOnlineSettlementsInTx,
+  runInTransaction,
+  mapNegotiationRow,
+  parsePositiveInt,
+  validationError,
+  invalidStateError,
   buildInvoiceCode,
   buildSettlementCode,
   buildVnpTxnRef,

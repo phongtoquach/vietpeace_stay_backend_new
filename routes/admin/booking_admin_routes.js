@@ -7,6 +7,7 @@ const router = express.Router();
 
 const bookingController = require("../../controllers/admin/booking/bookingController");
 const checkoutSettlementController = require("../../controllers/admin/booking/checkoutSettlementController");
+const compensationNegotiationController = require("../../controllers/admin/booking/compensationNegotiationController");
 const requireAdminLogin = require("../../middlewares/requireAdminLogin");
 const requirePermission = require("../../middlewares/requirePermission");
 
@@ -69,6 +70,12 @@ router.post(
   requireAdminLogin,
   requirePermission("bookings.write"),
   checkoutSettlementController.settleBookingCheckout,
+);
+router.post(
+  "/:id/compensation-negotiations",
+  requireAdminLogin,
+  requirePermission("bookings.write"),
+  compensationNegotiationController.createBookingNegotiation,
 );
 router.get(
   "/:id",

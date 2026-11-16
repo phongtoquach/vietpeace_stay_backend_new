@@ -123,4 +123,11 @@ router.use("/financial-reports", requireAdminLogin, financialReportAdminRoutes);
 const incidentalCatalogAdminRoutes = require("./incidental_catalog_admin_routes");
 router.use("/incidental-catalog", incidentalCatalogAdminRoutes);
 
+/**
+ * ADMIN COMPENSATION NEGOTIATIONS
+ * /api/admin/compensation-negotiations/*
+ */
+const compensationNegotiationAdminRoutes = require("./compensation_negotiation_admin_routes");
+router.use("/compensation-negotiations", compensationNegotiationAdminRoutes);
+
 module.exports = router;

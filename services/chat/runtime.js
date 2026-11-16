@@ -601,10 +601,32 @@ function triggerOutboxDrain() {
   setImmediate(() => drainOutboxOnce().catch(() => {}));
 }
 
+function emitCompensationEvent(eventName, payload = {}) {
+  try {
+    if (!ioInstance) return;
+    const nsp = ioInstance.of("/chat");
+    const targetRooms = new Set(["role:ADMIN"]);
+    const userIds = Array.isArray(payload.targetUserIds) ? payload.targetUserIds : [];
+    for (const uid of userIds) {
+      if (uid) {
+        targetRooms.add(actorRoom(`user:${String(uid).toLowerCase()}`));
+      }
+    }
+    let emitter = nsp;
+    for (const room of targetRooms) {
+      emitter = emitter.to(room);
+    }
+    emitter.emit(eventName, payload);
+  } catch (err) {
+    console.error("[chat.emitCompensationEvent]", err?.message || err);
+  }
+}
+
 module.exports = {
   attachChatSocket,
   stopWorkers,
   drainOutboxOnce,
   triggerOutboxDrain,
   getRuntime,
+  emitCompensationEvent,
 };
