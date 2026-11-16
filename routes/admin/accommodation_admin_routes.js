@@ -7,8 +7,10 @@ const router = express.Router();
 
 const accommodationController = require("../../controllers/admin/accommodation/accommodationController");
 const accommodationManagerController = require("../../controllers/admin/accommodation/accommodationManagerController");
+const checkoutSettlementController = require("../../controllers/admin/booking/checkoutSettlementController");
 
 const requireAdminLogin = require("../../middlewares/requireAdminLogin");
+const requirePermission = require("../../middlewares/requirePermission");
 const requireRole = require("../../middlewares/requireRole");
 
 // 1. Phân quyền & Quản lý Manager (Dành riêng cho Super Admin)
@@ -62,6 +64,18 @@ router.delete(
   requireAdminLogin,
   requireRole("ADMIN"),
   accommodationController.deleteAccommodation,
+);
+router.get(
+  "/:id/incidental-catalog",
+  requireAdminLogin,
+  requirePermission("bookings.read"),
+  checkoutSettlementController.getIncidentalCatalog,
+);
+router.post(
+  "/:id/incidental-catalog",
+  requireAdminLogin,
+  requirePermission("bookings.write"),
+  checkoutSettlementController.createIncidentalCatalogItem,
 );
 router.get("/:id", requireAdminLogin, accommodationController.getAccommodationDetail);
 

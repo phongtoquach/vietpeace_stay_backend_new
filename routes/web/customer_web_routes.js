@@ -7,6 +7,7 @@ const router = express.Router();
 
 const customerController = require("../../controllers/web/customer/customerController");
 const customerBookingsController = require("../../controllers/web/customer/customerBookingsController");
+const customerSettlementController = require("../../controllers/web/customer/customerSettlementController");
 
 //const requireCustomerLogin = require("../middlewares/requireCustomerLogin");
 
@@ -22,6 +23,7 @@ router.post("/change-password", customerController.changeAccountPassword);
 // API lấy danh sách các booking của user login
 router.get("/bookings", customerBookingsController.getCustomerBookings);
 router.get("/bookings/:bookingId", customerBookingsController.getCustomerBookingDetail);
+router.post("/bookings/:bookingId/settlement/vnpay-create", customerSettlementController.createCustomerSettlementVnpay);
 
 
 // export

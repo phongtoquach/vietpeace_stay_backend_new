@@ -56,6 +56,16 @@ router.use("/booking", bookingWebRoutes);
 const paymentWebRoutes = require("./payment_web_routes");
 router.use("/payment", paymentWebRoutes);
 
+/**
+ * Kết quả VNPay cho phần kết toán phát sinh trả phòng (tách biệt với booking_web/payment_web)
+ * POST /api/web/checkout-settlement/vnpay-return
+ */
+const customerSettlementController = require("../../controllers/web/customer/customerSettlementController");
+router.post(
+  "/checkout-settlement/vnpay-return",
+  customerSettlementController.verifyCheckoutSettlementVnpayReturn,
+);
+
 
 /**
  * [PUBLIC APIS] Các API để lookup

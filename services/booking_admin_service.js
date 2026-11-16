@@ -149,6 +149,16 @@ function mapBookingSummary(row) {
     checkedOutAt: toIsoString(row.checked_out_at),
     operationalStatus: getOperationalStatus(row),
     specialRequests: row.special_requests ?? null,
+    settlement: {
+      invoiceCode: row.invoice_code ?? null,
+      settlementStatus:
+        row.settlement_status ?? (row.checked_out_at ? "SETTLED" : "DRAFT"),
+      incidentalGrandTotal: toNumber(row.incidental_grand_total),
+      settlementDueAmount: toNumber(
+        row.settlement_due_amount ?? row.incidental_grand_total,
+      ),
+      settledAt: toIsoString(row.settled_at),
+    },
   };
 }
 
@@ -280,9 +290,20 @@ async function getBookingList(query = {}, currentUser = {}) {
       b.checked_in_at,
       b.checked_out_at,
       b.special_requests,
-      room_type_names.names AS room_type_names
+      room_type_names.names AS room_type_names,
+      inv.invoice_code,
+      inv.settlement_status,
+      inv.settled_at,
+      COALESCE(inv.incidental_grand_total, charge_agg.incidental_total, 0) AS incidental_grand_total,
+      COALESCE(inv.settlement_due_amount, charge_agg.incidental_total, 0) AS settlement_due_amount
     FROM dbo.bookings b
     JOIN dbo.accommodations a ON a.id = b.accommodation_id
+    LEFT JOIN dbo.booking_checkout_invoices inv ON inv.booking_id = b.id
+    OUTER APPLY (
+      SELECT SUM(c.total_amount) AS incidental_total
+      FROM dbo.booking_incidental_charges c
+      WHERE c.booking_id = b.id AND c.status = 'ACTIVE'
+    ) charge_agg
     OUTER APPLY (
       SELECT TOP 1 am.user_id
       FROM dbo.accommodation_managers am
@@ -385,6 +406,16 @@ function mapBookingDetail(row, items) {
       pendingExpiresAt: toIsoString(row.pending_expires_at),
     },
     specialRequests: row.special_requests,
+    settlement: {
+      invoiceCode: row.invoice_code ?? null,
+      settlementStatus:
+        row.settlement_status ?? (row.checked_out_at ? "SETTLED" : "DRAFT"),
+      incidentalGrandTotal: toNumber(row.incidental_grand_total),
+      settlementDueAmount: toNumber(
+        row.settlement_due_amount ?? row.incidental_grand_total,
+      ),
+      settledAt: toIsoString(row.settled_at),
+    },
     items: items.map(mapBookingItem),
   };
 }
@@ -448,9 +479,20 @@ async function getBookingDetail(bookingId, currentUser = {}) {
       a.email AS accommodation_email,
       a.address_line AS accommodation_address,
       a.check_in_time AS accommodation_check_in_time,
-      a.check_out_time AS accommodation_check_out_time
+      a.check_out_time AS accommodation_check_out_time,
+      inv.invoice_code,
+      inv.settlement_status,
+      inv.settled_at,
+      COALESCE(inv.incidental_grand_total, charge_agg.incidental_total, 0) AS incidental_grand_total,
+      COALESCE(inv.settlement_due_amount, charge_agg.incidental_total, 0) AS settlement_due_amount
     FROM dbo.bookings b
     JOIN dbo.accommodations a ON a.id = b.accommodation_id
+    LEFT JOIN dbo.booking_checkout_invoices inv ON inv.booking_id = b.id
+    OUTER APPLY (
+      SELECT SUM(c.total_amount) AS incidental_total
+      FROM dbo.booking_incidental_charges c
+      WHERE c.booking_id = b.id AND c.status = 'ACTIVE'
+    ) charge_agg
     OUTER APPLY (
       SELECT TOP 1 am.user_id
       FROM dbo.accommodation_managers am
@@ -750,6 +792,29 @@ async function checkOutBooking(bookingId, currentUser = {}) {
       409,
       ERROR_CODES.INVALID_STATE,
       "Booking chưa được nhận phòng.",
+    );
+  }
+
+  const pendingCheck = await pool
+    .request()
+    .input("bookingId", sql.BigInt, id)
+    .query(`
+      SELECT
+        COALESCE(SUM(CASE WHEN status = 'ACTIVE' THEN total_amount ELSE 0 END), 0) AS active_incidental_total,
+        (SELECT TOP 1 settlement_status FROM dbo.booking_checkout_invoices WHERE booking_id = @bookingId) AS settlement_status
+      FROM dbo.booking_incidental_charges
+      WHERE booking_id = @bookingId;
+    `);
+  const pendingRow = pendingCheck.recordset[0];
+  if (
+    pendingRow &&
+    pendingRow.settlement_status !== "SETTLED" &&
+    Number(pendingRow.active_incidental_total || 0) > 0
+  ) {
+    throw new BookingAdminServiceError(
+      409,
+      ERROR_CODES.INVALID_STATE,
+      "Đơn đặt phòng đang có khoản phát sinh chưa tất toán, vui lòng sử dụng Kết toán & Trả phòng.",
     );
   }
 
