@@ -12,6 +12,52 @@ const { TOOL_DECLARATIONS, executeTool } = require("./tools");
 const provider = require("./provider");
 const { todayInVietnam } = require("../room_recommendation_service");
 
+function mergeDiscussedContext(prevCtx, runContext) {
+  const safePrev = prevCtx && typeof prevCtx === "object" ? prevCtx : {};
+  const newProps = Array.isArray(runContext?.discussedAccommodations) ? runContext.discussedAccommodations : [];
+  const lastSearchLoc = runContext?.lastSearchLocation || null;
+
+  if (newProps.length === 0 && !lastSearchLoc) {
+    return { changed: false, nextContext: safePrev };
+  }
+
+  let discussed = Array.isArray(safePrev.discussedAccommodations) ? [...safePrev.discussedAccommodations] : [];
+  let activeLocation = safePrev.activeLocation || null;
+
+  if (runContext?.hasCitySearch && lastSearchLoc?.id) {
+    // Explicit location search narrows discussed list to properties in this destination
+    discussed = discussed.filter((item) => Number(item.locationId) === Number(lastSearchLoc.id));
+    activeLocation = { id: Number(lastSearchLoc.id), name: lastSearchLoc.name || null };
+  }
+
+  if (newProps.length > 0) {
+    const seen = new Set();
+    const merged = [];
+    for (const item of [...newProps, ...discussed]) {
+      const aid = Number(item?.accommodationId);
+      if (!aid || seen.has(aid)) continue;
+      seen.add(aid);
+      merged.push(item);
+      if (merged.length >= 5) break;
+    }
+    discussed = merged;
+    if (newProps[0]?.locationId) {
+      activeLocation = { id: Number(newProps[0].locationId), name: newProps[0].locationName || null };
+    }
+  } else if (lastSearchLoc?.id) {
+    activeLocation = { id: Number(lastSearchLoc.id), name: lastSearchLoc.name || null };
+  }
+
+  return {
+    changed: true,
+    nextContext: {
+      ...safePrev,
+      discussedAccommodations: discussed,
+      activeLocation,
+    },
+  };
+}
+
 function buildSystemPrompt({ conv, pageContext, actor, today }) {
   const ctxLines = [];
   if (pageContext?.pageType === "ACCOMMODATION_DETAIL" && pageContext.accommodationId) {
@@ -68,13 +114,18 @@ ${actorLine}
 ${ctxLines.join("\n")}`;
 }
 
-function withTimeout(promise, ms, label) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`Timeout after ${ms}ms (${label})`)), ms),
-    ),
-  ]);
+async function withTimeout(promise, ms, label) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Timeout after ${ms}ms (${label})`)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function isAiTurnStillValid(conversationId, expectedRevision, expectedRunId) {
@@ -107,7 +158,7 @@ async function isAiTurnStillValid(conversationId, expectedRevision, expectedRunI
  * Executed by outbox/AI scheduler when `ai_due_at <= now`.
  * Respects trailing-edge debounce: if `ai_due_at > now`, reschedules instead of running prematurely.
  */
-async function executeAiJob(conversationId, runtime) {
+async function executeAiJob(conversationId, runtime, { outboxJobId = null } = {}) {
   const pool = getDBPool();
   const cid = Number(conversationId);
 
@@ -144,6 +195,20 @@ async function executeAiJob(conversationId, runtime) {
     const conv = res.recordset[0];
     if (!conv) return { action: "SKIP" };
     if (conv.status !== "OPEN" || conv.handlingMode !== "AI") return { action: "SKIP" };
+    if (!conv.aiDueAt && outboxJobId) {
+      // The lease can be reclaimed after a process stops mid-answer. Resume
+      // only the run owned by this durable job, never a newer user turn.
+      const interrupted = await newRequest(tx)
+        .input("cid", sqlObj.BigInt, cid)
+        .input("jobId", sqlObj.BigInt, outboxJobId)
+        .query(`SELECT r.id FROM dbo.chat_ai_runs AS r
+                INNER JOIN dbo.chat_outbox AS o
+                  ON r.id = TRY_CAST(JSON_VALUE(o.payload_json, '$.aiRunId') AS BIGINT)
+                INNER JOIN dbo.chat_conversations AS c ON c.id = r.conversation_id
+                WHERE o.id = @jobId AND r.conversation_id = @cid AND r.status = 'RUNNING'
+                  AND r.control_revision = c.control_revision;`);
+      if (interrupted.recordset.length) conv.aiDueAt = new Date();
+    }
     if (!conv.aiDueAt) return { action: "SKIP" };
     if (!config.aiEnabled()) return { action: "DISABLED", conv };
 
@@ -188,13 +253,20 @@ async function executeAiJob(conversationId, runtime) {
       `);
 
     const runId = Number(runRes.recordset[0].id);
+    if (outboxJobId) {
+      await newRequest(tx)
+        .input("jobId", sqlObj.BigInt, outboxJobId)
+        .input("runId", sqlObj.BigInt, runId)
+        .query(`UPDATE dbo.chat_outbox SET payload_json = JSON_MODIFY(payload_json, '$.aiRunId', @runId)
+                WHERE id = @jobId;`);
+    }
     return { action: "RUN", conv, runId };
   });
 
   if (!claimed || claimed.action === "SKIP" || claimed.action === "DEFERRED") return;
 
   if (claimed.action === "DISABLED") {
-    runtime?.emitToConversation(cid, "ai:failed", {
+    await runtime?.emitToConversation(cid, "ai:failed", {
       conversationId: cid,
       errorCode: "AI_DISABLED",
       message: "Trợ lý AI hiện đang tạm tắt bởi quản trị viên.",
@@ -223,120 +295,149 @@ async function executeAiJob(conversationId, runtime) {
 
   const contextObj = parseJsonSafe(conv.contextJson, {}) || {};
   const pageContext = contextObj.pageContext || {};
-
-  // Check per-accommodation/platform support settings for ai_enabled
-  const settingsRes = await pool
-    .request()
-    .input("accomId", sqlObj.Int, conv.accommodationId || null)
-    .query(`
-      SELECT TOP 1 ai_enabled AS aiEnabled
-      FROM dbo.chat_support_settings
-      WHERE accommodation_id = @accomId OR accommodation_id IS NULL
-      ORDER BY CASE WHEN accommodation_id = @accomId THEN 0 ELSE 1 END;
-    `);
-  if (settingsRes.recordset[0] && !settingsRes.recordset[0].aiEnabled) {
-    await pool
-      .request()
-      .input("runId", sqlObj.BigInt, runId)
-      .query(`UPDATE dbo.chat_ai_runs SET status = 'CANCELLED', completed_at = SYSUTCDATETIME() WHERE id = @runId;`);
-    runtime?.emitToConversation(cid, "ai:failed", {
-      conversationId: cid,
-      runId,
-      errorCode: "AI_DISABLED_FOR_PROPERTY",
-      message: "Trợ lý AI tại cơ sở này hiện đang tạm tắt.",
-    });
-    return;
-  }
-
-  // Load latest 24 visible conversation messages (PUBLIC + owner's OWNER_ONLY, excluding STAFF/SYSTEM noise where appropriate)
-  const histRes = await pool
-    .request()
-    .input("cid", sqlObj.BigInt, cid)
-    .query(`
-      SELECT TOP 24
-        sender_type AS senderType,
-        message_type AS messageType,
-        visibility,
-        content,
-        payload_json AS payloadJson,
-        sequence
-      FROM dbo.chat_messages
-      WHERE conversation_id = @cid
-        AND visibility IN ('PUBLIC', 'OWNER_ONLY')
-        AND message_type NOT IN ('INTERNAL_NOTE', 'AI_DRAFT')
-      ORDER BY sequence DESC;
-    `);
-
-  const chronological = [...histRes.recordset].reverse();
-  const contents = [];
-  for (const m of chronological) {
-    if (m.senderType === "GUEST" || m.senderType === "CUSTOMER") {
-      contents.push({ role: "user", parts: [{ text: m.content }] });
-    } else if (m.senderType === "AI") {
-      contents.push({ role: "model", parts: [{ text: m.content }] });
-    } else if (m.senderType === "SYSTEM" && m.messageType === "PROPERTY_CARD") {
-      const p = parseJsonSafe(m.payloadJson, {});
-      if (p?.accommodationName) {
-        contents.push({
-          role: "user",
-          parts: [{ text: `[Ngữ cảnh đính kèm: Cơ sở ${p.accommodationName} (ID ${p.accommodationId})]` }],
-        });
-      }
-    }
-  }
-  if (contents.length === 0) {
-    contents.push({ role: "user", parts: [{ text: "Xin chào" }] });
-  }
-
   const abortController = new AbortController();
   const deadlineTimer = setTimeout(() => abortController.abort(), config.aiTimeoutMs);
-
-  const systemPrompt = buildSystemPrompt({
-    conv: {
-      ...conv,
-      scopeType: conv.scopeType,
-      accommodationId: conv.accommodationId ? Number(conv.accommodationId) : null,
-    },
-    pageContext,
-    actor,
-    today: todayInVietnam(),
-  });
-
-  const runContext = {
-    actor,
-    conversationId: cid,
-    cardsToEmit: [],
-    hasPrivateBookingRead: false,
-  };
-
-  runtime?.emitToConversation(cid, "ai:started", { conversationId: cid, runId });
-
   let deltaBuffer = "";
   let flushTimer = null;
   let totalStreamedText = "";
   let totalToolCalls = 0;
+  let lastValidityCheckAt = 0;
+
+  async function collectDelta(piece) {
+    if (abortController.signal.aborted) {
+      throw Object.assign(new Error("AI response timed out."), { errorCode: "AI_TIMEOUT" });
+    }
+    if (Date.now() - lastValidityCheckAt >= 250) {
+      if (!(await isAiTurnStillValid(cid, conv.controlRevision, runId))) {
+        throw Object.assign(new Error("AI turn was superseded."), { errorCode: "AI_CANCELLED" });
+      }
+      lastValidityCheckAt = Date.now();
+    }
+    totalStreamedText += piece;
+    deltaBuffer += piece;
+    if (!flushTimer) {
+      flushTimer = setTimeout(() => {
+        flushTimer = null;
+        flushDeltas(false).catch((err) => console.error("[chat.ai.delta]", cid, err));
+      }, 80);
+    }
+  }
 
   async function flushDeltas(force = false) {
-    if (!deltaBuffer) return;
-    const chunk = deltaBuffer;
-    deltaBuffer = "";
-    runtime?.emitToConversation(cid, "ai:delta", { conversationId: cid, runId, delta: chunk });
     if (force && flushTimer) {
       clearTimeout(flushTimer);
       flushTimer = null;
     }
+    if (!deltaBuffer) return;
+    const chunk = deltaBuffer;
+    deltaBuffer = "";
+    await runtime?.emitToConversation(cid, "ai:delta", { conversationId: cid, runId, delta: chunk });
   }
 
   try {
+
+    // Check per-accommodation/platform support settings for ai_enabled
+    const settingsRes = await pool
+      .request()
+      .input("accomId", sqlObj.Int, conv.accommodationId || null)
+      .query(`
+        SELECT TOP 1 ai_enabled AS aiEnabled
+        FROM dbo.chat_support_settings
+        WHERE accommodation_id = @accomId OR accommodation_id IS NULL
+        ORDER BY CASE WHEN accommodation_id = @accomId THEN 0 ELSE 1 END;
+      `);
+    if (settingsRes.recordset[0] && !settingsRes.recordset[0].aiEnabled) {
+      await pool
+        .request()
+        .input("runId", sqlObj.BigInt, runId)
+        .query(`UPDATE dbo.chat_ai_runs SET status = 'CANCELLED', completed_at = SYSUTCDATETIME() WHERE id = @runId;`);
+      await runtime?.emitToConversation(cid, "ai:failed", {
+        conversationId: cid,
+        runId,
+        errorCode: "AI_DISABLED_FOR_PROPERTY",
+        message: "Trợ lý AI tại cơ sở này hiện đang tạm tắt.",
+      });
+      return;
+    }
+
+    // Load latest 24 visible conversation messages (PUBLIC + owner's OWNER_ONLY, excluding STAFF/SYSTEM noise where appropriate)
+    const histRes = await pool
+      .request()
+      .input("cid", sqlObj.BigInt, cid)
+      .query(`
+        SELECT TOP 24
+          sender_type AS senderType,
+          message_type AS messageType,
+          visibility,
+          content,
+          payload_json AS payloadJson,
+          sequence
+        FROM dbo.chat_messages
+        WHERE conversation_id = @cid
+          AND visibility IN ('PUBLIC', 'OWNER_ONLY')
+          AND message_type NOT IN ('INTERNAL_NOTE', 'AI_DRAFT')
+        ORDER BY sequence DESC;
+      `);
+
+    const chronological = [...histRes.recordset].reverse();
+    const contents = [];
+    for (const m of chronological) {
+      if (m.senderType === "GUEST" || m.senderType === "CUSTOMER") {
+        contents.push({ role: "user", parts: [{ text: m.content }] });
+      } else if (m.senderType === "MANAGER") {
+        contents.push({ role: "model", parts: [{ text: `[Quản lý cơ sở đã tư vấn] ${m.content}` }] });
+      } else if (m.senderType === "AI") {
+        contents.push({ role: "model", parts: [{ text: m.content }] });
+      } else if (m.senderType === "SYSTEM" && m.messageType === "PROPERTY_CARD") {
+        const p = parseJsonSafe(m.payloadJson, {});
+        if (p?.accommodationName) {
+          contents.push({
+            role: "user",
+            parts: [{ text: `[Ngữ cảnh đính kèm: Cơ sở ${p.accommodationName} (ID ${p.accommodationId})]` }],
+          });
+        }
+      }
+    }
+    if (contents.length === 0) {
+      contents.push({ role: "user", parts: [{ text: "Xin chào" }] });
+    }
+
+    const systemPrompt = buildSystemPrompt({
+      conv: {
+        ...conv,
+        scopeType: conv.scopeType,
+        accommodationId: conv.accommodationId ? Number(conv.accommodationId) : null,
+      },
+      pageContext,
+      actor,
+      today: todayInVietnam(),
+    });
+
+    const runContext = {
+      actor,
+      conversationId: cid,
+      cardsToEmit: [],
+      // An answer can reuse private information from history without calling a tool again.
+      hasPrivateBookingRead: chronological.some((message) => message.visibility === "OWNER_ONLY"),
+      discussedAccommodations: [],
+      lastSearchLocation: null,
+      hasCitySearch: false,
+    };
+
+    await runtime?.emitToConversation(cid, "ai:started", { conversationId: cid, runId });
+
     let finalAnswerText = "";
     let lastUsage = null;
     const workingContents = [...contents];
 
     for (let round = 0; round < 4; round++) {
+      if (abortController.signal.aborted) {
+        throw Object.assign(new Error("AI response timed out."), { errorCode: "AI_TIMEOUT" });
+      }
       const valid = await isAiTurnStillValid(cid, conv.controlRevision, runId);
       if (!valid) {
         await abortController.abort();
-        runtime?.emitToConversation(cid, "ai:cancelled", { conversationId: cid, runId });
+        await runtime?.emitToConversation(cid, "ai:cancelled", { conversationId: cid, runId });
         return;
       }
 
@@ -345,16 +446,7 @@ async function executeAiJob(conversationId, runtime) {
         system: systemPrompt,
         tools: TOOL_DECLARATIONS,
         signal: abortController.signal,
-        onDelta: async (piece) => {
-          totalStreamedText += piece;
-          deltaBuffer += piece;
-          if (!flushTimer) {
-            flushTimer = setTimeout(() => {
-              flushTimer = null;
-              flushDeltas(false);
-            }, 80);
-          }
-        },
+        onDelta: collectDelta,
       });
 
       await flushDeltas(true);
@@ -370,21 +462,39 @@ async function executeAiJob(conversationId, runtime) {
       const roundCalls = genRes.calls.slice(0, 8);
       const responseParts = [];
 
-      for (const call of roundCalls) {
-        if (totalToolCalls >= 12) break;
-        totalToolCalls += 1;
+      for (const call of genRes.calls) {
+        if (abortController.signal.aborted) {
+          throw Object.assign(new Error("AI response timed out."), { errorCode: "AI_TIMEOUT" });
+        }
         let toolOutput;
-        try {
-          toolOutput = await withTimeout(
-            executeTool(call.name, call.args || {}, runContext),
-            config.toolTimeoutMs,
-            call.name,
-          );
-        } catch (toolErr) {
-          toolOutput = { status: "TOOL_ERROR", message: toolErr?.message || "Lỗi truy vấn dữ liệu." };
+        if (!roundCalls.includes(call) || totalToolCalls >= 12) {
+          toolOutput = { status: "TOOL_LIMIT", message: "Đã đạt giới hạn truy vấn trong lượt trả lời này." };
+        } else {
+          totalToolCalls += 1;
+          // Discard late tool side effects after a timeout instead of mutating the live run.
+          const toolContext = {
+            ...runContext,
+            cardsToEmit: [],
+            discussedAccommodations: [...runContext.discussedAccommodations],
+          };
+          try {
+            toolOutput = await withTimeout(
+              executeTool(call.name, call.args || {}, toolContext),
+              config.toolTimeoutMs,
+              call.name,
+            );
+            runContext.cardsToEmit.push(...toolContext.cardsToEmit);
+            runContext.discussedAccommodations = toolContext.discussedAccommodations;
+            runContext.lastSearchLocation = toolContext.lastSearchLocation;
+            runContext.hasCitySearch = toolContext.hasCitySearch;
+            runContext.hasPrivateBookingRead ||= toolContext.hasPrivateBookingRead;
+          } catch (toolErr) {
+            toolOutput = { status: "TOOL_ERROR", message: toolErr?.message || "Lỗi truy vấn dữ liệu." };
+          }
         }
         responseParts.push({
           functionResponse: {
+            ...(call.id ? { id: call.id } : {}),
             name: call.name,
             response: { result: toolOutput },
           },
@@ -399,10 +509,7 @@ async function executeAiJob(conversationId, runtime) {
           system: systemPrompt,
           tools: [],
           signal: abortController.signal,
-          onDelta: async (piece) => {
-            totalStreamedText += piece;
-            deltaBuffer += piece;
-          },
+          onDelta: collectDelta,
         });
         await flushDeltas(true);
         finalAnswerText = finalGen.text || totalStreamedText;
@@ -421,9 +528,12 @@ async function executeAiJob(conversationId, runtime) {
 
       const checkRes = await newRequest(tx)
         .input("cid", sqlObj.BigInt, cid)
+        .input("runId", sqlObj.BigInt, runId)
         .query(`
           SELECT status, handling_mode AS handlingMode, control_revision AS controlRevision,
-                 retention_state AS retentionState, customer_user_id AS customerUserId
+                 retention_state AS retentionState, customer_user_id AS customerUserId,
+                 context_json AS contextJson,
+                 (SELECT status FROM dbo.chat_ai_runs WHERE id = @runId AND conversation_id = @cid) AS runStatus
           FROM dbo.chat_conversations
           WHERE id = @cid;
         `);
@@ -432,12 +542,23 @@ async function executeAiJob(conversationId, runtime) {
         !latest ||
         latest.status !== "OPEN" ||
         latest.handlingMode !== "AI" ||
+        latest.runStatus !== "RUNNING" ||
+        abortController.signal.aborted ||
         Number(latest.controlRevision) !== Number(conv.controlRevision)
       ) {
         await newRequest(tx)
           .input("runId", sqlObj.BigInt, runId)
-          .query(`UPDATE dbo.chat_ai_runs SET status = 'CANCELLED', completed_at = SYSUTCDATETIME() WHERE id = @runId;`);
+          .query(`UPDATE dbo.chat_ai_runs SET status = 'CANCELLED', completed_at = SYSUTCDATETIME() WHERE id = @runId AND status = 'RUNNING';`);
         return { cancelled: true };
+      }
+
+      const prevContextObj = parseJsonSafe(latest.contextJson, {}) || {};
+      const mergedCtx = mergeDiscussedContext(prevContextObj, runContext);
+      if (mergedCtx.changed) {
+        await newRequest(tx)
+          .input("cid", sqlObj.BigInt, cid)
+          .input("ctxJson", sqlObj.NVarChar(sqlObj.MAX), JSON.stringify(mergedCtx.nextContext))
+          .query(`UPDATE dbo.chat_conversations SET context_json = @ctxJson WHERE id = @cid;`);
       }
 
       await newRequest(tx)
@@ -456,12 +577,13 @@ async function executeAiJob(conversationId, runtime) {
         const seqRes = await newRequest(tx)
           .input("cid", sqlObj.BigInt, cid)
           .input("preview", sqlObj.NVarChar(300), previewText(textContent))
+          .input("previewVisibility", sqlObj.VarChar(16), msgVisibility)
           .query(`
             UPDATE dbo.chat_conversations
             SET
               last_sequence = last_sequence + 1,
               last_message_at = SYSUTCDATETIME(),
-              last_message_preview = @preview,
+              last_message_preview = CASE WHEN @previewVisibility = 'PUBLIC' THEN @preview ELSE last_message_preview END,
               updated_at = SYSUTCDATETIME()
             OUTPUT INSERTED.last_sequence AS seq
             WHERE id = @cid;
@@ -514,7 +636,8 @@ async function executeAiJob(conversationId, runtime) {
 
       for (const card of runContext.cardsToEmit) {
         const cardTitle = card.payload?.title || card.payload?.accommodation?.accommodationName || "Thông tin chi tiết";
-        const cardMsg = await insertAiMsg(card.messageType, card.visibility || visibility, cardTitle, card.payload);
+        const cardVisibility = visibility === "OWNER_ONLY" ? "OWNER_ONLY" : card.visibility || visibility;
+        const cardMsg = await insertAiMsg(card.messageType, cardVisibility, cardTitle, card.payload);
         createdMessages.push(cardMsg);
       }
 
@@ -553,7 +676,9 @@ async function executeAiJob(conversationId, runtime) {
           conversationId: cid,
           runId,
           ownerKey,
+          visibility: "OWNER_ONLY",
           guestAiCloseAt: guestAiCloseAtIso,
+          context: mergedCtx.nextContext,
           messages: createdMessages,
         },
       });
@@ -562,27 +687,33 @@ async function executeAiJob(conversationId, runtime) {
     });
 
     if (saved?.cancelled) {
-      runtime?.emitToConversation(cid, "ai:cancelled", { conversationId: cid, runId });
+      await runtime?.emitToConversation(cid, "ai:cancelled", { conversationId: cid, runId });
     } else {
       runtime?.triggerOutboxDrain?.();
     }
   } catch (err) {
-    if (flushTimer) clearTimeout(flushTimer);
-    console.error("[chat.ai.execute]", cid, err);
+    const cancelled = err?.errorCode === "AI_CANCELLED" && !abortController.signal.aborted;
+    if (!cancelled) console.error("[chat.ai.execute]", cid, err);
 
-    await pool
+    const failedRun = await pool
       .request()
       .input("runId", sqlObj.BigInt, runId)
+      .input("status", sqlObj.VarChar(16), cancelled ? "CANCELLED" : "FAILED")
       .input("errCode", sqlObj.VarChar(80), err?.errorCode || "AI_FAILED")
       .input("errMsg", sqlObj.NVarChar(500), String(err?.message || "AI execution failed").slice(0, 480))
       .query(`
         UPDATE dbo.chat_ai_runs
-        SET status = 'FAILED', error_code = @errCode, error_message = @errMsg, completed_at = SYSUTCDATETIME()
-        WHERE id = @runId;
+        SET status = @status, error_code = @errCode, error_message = @errMsg, completed_at = SYSUTCDATETIME()
+        OUTPUT INSERTED.id
+        WHERE id = @runId AND status = 'RUNNING';
       `);
 
+    if (cancelled || !failedRun.recordset.length) {
+      await runtime?.emitToConversation(cid, "ai:cancelled", { conversationId: cid, runId });
+      return;
+    }
     // NO auto-escalation to Manager on AI failure! Keep mode = 'AI' cleanly.
-    runtime?.emitToConversation(cid, "ai:failed", {
+    await runtime?.emitToConversation(cid, "ai:failed", {
       conversationId: cid,
       runId,
       errorCode: err?.errorCode || "AI_FAILED",
@@ -590,6 +721,8 @@ async function executeAiJob(conversationId, runtime) {
     });
   } finally {
     clearTimeout(deadlineTimer);
+    if (flushTimer) clearTimeout(flushTimer);
+    abortController.abort();
   }
 }
 

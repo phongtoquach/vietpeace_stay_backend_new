@@ -30,6 +30,44 @@ function buildStayNights(checkinDate, checkoutDate) {
   return nights;
 }
 
+function findFeasibleGuestAllocation(totalAdults, totalChildren, capacities) {
+  // A greedy adult assignment can leave too little space for children. Search
+  // the bounded (rooms <= 10, adults <= 40, children <= 30) state space instead.
+  const count = capacities.length;
+  const suffix = Array.from({ length: count + 1 }, () => ({ adults: 0, children: 0, occupancy: 0 }));
+  for (let i = count - 1; i >= 0; i -= 1) {
+    const room = capacities[i].roomType;
+    suffix[i] = {
+      adults: suffix[i + 1].adults + Math.min(room.maxAdults, room.maxOccupancy),
+      children: suffix[i + 1].children + Math.min(room.maxChildren, room.maxOccupancy - 1),
+      occupancy: suffix[i + 1].occupancy + room.maxOccupancy,
+    };
+  }
+  const failed = new Set();
+  function visit(index, adultsLeft, childrenLeft) {
+    if (index === count) return adultsLeft === 0 && childrenLeft === 0 ? [] : null;
+    const remaining = count - index;
+    if (adultsLeft < remaining || adultsLeft > suffix[index].adults ||
+        childrenLeft > suffix[index].children || adultsLeft + childrenLeft > suffix[index].occupancy) return null;
+    const key = `${index}:${adultsLeft}:${childrenLeft}`;
+    if (failed.has(key)) return null;
+    const room = capacities[index].roomType;
+    const minAdults = Math.max(1, adultsLeft - suffix[index + 1].adults);
+    const maxAdults = Math.min(room.maxAdults, room.maxOccupancy, adultsLeft - remaining + 1);
+    for (let adults = minAdults; adults <= maxAdults; adults += 1) {
+      const minChildren = Math.max(0, childrenLeft - suffix[index + 1].children);
+      const maxChildren = Math.min(room.maxChildren, room.maxOccupancy - adults, childrenLeft);
+      for (let children = minChildren; children <= maxChildren; children += 1) {
+        const rest = visit(index + 1, adultsLeft - adults, childrenLeft - children);
+        if (rest) return [{ roomTypeId: room.id, adults, children }, ...rest];
+      }
+    }
+    failed.add(key);
+    return null;
+  }
+  return visit(0, totalAdults, totalChildren);
+}
+
 function distributeGuestsIntoSlots(totalAdults, totalChildren, capacities) {
   // Heuristic greedy balanced assignment trying to satisfy adults first, then children within maxOccupancy.
   // capacities is array of { roomType, roomByIdRow } already chosen, sorted by maxOccupancy desc.
@@ -71,7 +109,7 @@ function distributeGuestsIntoSlots(totalAdults, totalChildren, capacities) {
       }
     }
   }
-  if (remainingAdults > 0) return null;
+  if (remainingAdults > 0) return findFeasibleGuestAllocation(totalAdults, totalChildren, capacities);
 
   // Distribute children within includedChildren first, then maxChildren & maxOccupancy
   for (let pass = 0; pass < 2 && remainingChildren > 0; pass++) {
@@ -88,7 +126,7 @@ function distributeGuestsIntoSlots(totalAdults, totalChildren, capacities) {
       }
     }
   }
-  if (remainingChildren > 0) return null;
+  if (remainingChildren > 0) return findFeasibleGuestAllocation(totalAdults, totalChildren, capacities);
 
   return slots.map((s) => ({
     roomTypeId: s.roomType.id,

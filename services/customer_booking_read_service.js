@@ -1,4 +1,5 @@
 const { getDBPool, sqlObj } = require("../configs/database");
+const { computeFolioSummary, buildInvoiceCode } = require("./checkout_settlement_service");
 
 const BOOKING_SUMMARY_SQL = `
   SELECT
@@ -46,6 +47,8 @@ const BOOKING_SUMMARY_SQL = `
     b.failed_at AS failedAt,
     b.failure_code AS failureCode,
     b.failure_message AS failureMessage,
+    b.checked_in_at AS checkedInAt,
+    b.checked_out_at AS checkedOutAt,
     b.created_at AS createdAt,
     b.updated_at AS updatedAt,
     pay.payment_code AS latestPaymentCode,
@@ -53,10 +56,22 @@ const BOOKING_SUMMARY_SQL = `
     pay.status AS latestPaymentStatus,
     CAST(pay.amount AS FLOAT) AS latestPaymentAmount,
     CAST(pay.refunded_amount AS FLOAT) AS latestPaymentRefundedAmount,
-    pay.paid_at AS latestPaidAt
+    pay.paid_at AS latestPaidAt,
+    inv.invoice_code AS invoiceCode,
+    inv.settlement_status AS settlementStatus,
+    CAST(COALESCE(inv.incidental_grand_total, chAgg.incidentalTotal, 0) AS FLOAT) AS incidentalGrandTotal,
+    CAST(COALESCE(inv.settlement_due_amount, chAgg.incidentalTotal, 0) AS FLOAT) AS settlementDueAmount,
+    CAST(COALESCE(inv.settlement_paid_amount, 0) AS FLOAT) AS settlementPaidAmount,
+    inv.settled_at AS settledAt
   FROM dbo.bookings AS b
   INNER JOIN dbo.accommodations AS a ON a.id = b.accommodation_id
   LEFT JOIN dbo.locations AS l ON l.id = a.location_id
+  LEFT JOIN dbo.booking_checkout_invoices AS inv ON inv.booking_id = b.id
+  OUTER APPLY (
+    SELECT SUM(c.total_amount) AS incidentalTotal
+    FROM dbo.booking_incidental_charges AS c
+    WHERE c.booking_id = b.id AND c.status = 'ACTIVE'
+  ) AS chAgg
   OUTER APPLY (
     SELECT TOP 1 image_url
     FROM dbo.accommodation_images AS ai
@@ -128,8 +143,18 @@ function mapBookingRow(row) {
     failedAt: row.failedAt ? new Date(row.failedAt).toISOString() : null,
     failureCode: row.failureCode || null,
     failureMessage: row.failureMessage || null,
+    checkedInAt: row.checkedInAt ? new Date(row.checkedInAt).toISOString() : null,
+    checkedOutAt: row.checkedOutAt ? new Date(row.checkedOutAt).toISOString() : null,
     createdAt: row.createdAt ? new Date(row.createdAt).toISOString() : null,
     updatedAt: row.updatedAt ? new Date(row.updatedAt).toISOString() : null,
+    checkoutSummary: {
+      invoiceCode: row.invoiceCode || null,
+      settlementStatus: row.settlementStatus || (row.checkedOutAt ? "SETTLED" : null),
+      incidentalGrandTotal: Number(row.incidentalGrandTotal || 0),
+      settlementDueAmount: Number(row.settlementDueAmount || 0),
+      settlementPaidAmount: Number(row.settlementPaidAmount || 0),
+      settledAt: row.settledAt ? new Date(row.settledAt).toISOString() : null,
+    },
     latestPayment: row.latestPaymentCode
       ? {
           paymentCode: row.latestPaymentCode,
@@ -296,9 +321,201 @@ async function getCustomerBookingByCodeOrId(customerId, { bookingId, bookingCode
       FROM dbo.payments AS p
       WHERE p.booking_id = @bookingId
       ORDER BY p.created_at DESC, p.id DESC;
+
+      SELECT
+        CONVERT(VARCHAR(19), c.id) AS id,
+        c.category,
+        c.item_name AS itemName,
+        c.unit_label AS unitLabel,
+        c.quantity,
+        CAST(c.unit_price AS FLOAT) AS unitPrice,
+        c.compensation_mode AS compensationMode,
+        CAST(c.depreciation_percent AS FLOAT) AS depreciationPercent,
+        CAST(c.adjustment_amount AS FLOAT) AS adjustmentAmount,
+        c.is_tax_inclusive AS isTaxInclusive,
+        CAST(c.subtotal_amount AS FLOAT) AS subtotalAmount,
+        CAST(c.tax_rate AS FLOAT) AS taxRate,
+        CAST(c.tax_amount AS FLOAT) AS taxAmount,
+        CAST(c.total_amount AS FLOAT) AS totalAmount,
+        c.note,
+        c.evidence_image_url AS evidenceImageUrl,
+        c.status,
+        c.created_at AS createdAt
+      FROM dbo.booking_incidental_charges AS c
+      WHERE c.booking_id = @bookingId
+        AND c.status = 'ACTIVE'
+      ORDER BY c.created_at ASC, c.id ASC;
+
+      SELECT
+        CONVERT(VARCHAR(19), inv.id) AS id,
+        inv.invoice_code AS invoiceCode,
+        CAST(inv.booking_original_total AS FLOAT) AS bookingOriginalTotal,
+        CAST(inv.prepaid_amount AS FLOAT) AS prepaidAmount,
+        CAST(inv.minibar_total AS FLOAT) AS minibarTotal,
+        CAST(inv.extra_service_total AS FLOAT) AS extraServiceTotal,
+        CAST(inv.special_cleaning_total AS FLOAT) AS specialCleaningTotal,
+        CAST(inv.compensation_total AS FLOAT) AS compensationTotal,
+        CAST(inv.incidental_tax_total AS FLOAT) AS incidentalTaxTotal,
+        CAST(inv.incidental_grand_total AS FLOAT) AS incidentalGrandTotal,
+        CAST(inv.stay_grand_total AS FLOAT) AS stayGrandTotal,
+        CAST(inv.settlement_due_amount AS FLOAT) AS settlementDueAmount,
+        CAST(inv.settlement_paid_amount AS FLOAT) AS settlementPaidAmount,
+        inv.settlement_status AS settlementStatus,
+        inv.guest_confirmed AS guestConfirmed,
+        inv.note,
+        su.full_name AS settledByName,
+        inv.settled_at AS settledAt,
+        inv.created_at AS createdAt
+      FROM dbo.booking_checkout_invoices AS inv
+      LEFT JOIN dbo.users AS su ON su.id = inv.settled_by
+      WHERE inv.booking_id = @bookingId;
+
+      SELECT
+        CONVERT(VARCHAR(19), sp.id) AS id,
+        sp.settlement_code AS settlementCode,
+        sp.payment_method AS paymentMethod,
+        CAST(sp.amount AS FLOAT) AS amount,
+        CAST(sp.cash_received AS FLOAT) AS cashReceived,
+        CAST(sp.cash_change AS FLOAT) AS cashChange,
+        sp.provider_ref AS providerRef,
+        sp.vnp_txn_ref AS vnpTxnRef,
+        sp.status,
+        cu.full_name AS confirmedByName,
+        sp.paid_at AS paidAt,
+        sp.note,
+        sp.created_at AS createdAt
+      FROM dbo.checkout_settlement_payments AS sp
+      LEFT JOIN dbo.users AS cu ON cu.id = sp.confirmed_by
+      WHERE sp.booking_id = @bookingId
+      ORDER BY sp.created_at DESC, sp.id DESC;
     `);
 
-  const [itemRows, paymentRows] = detailRes.recordsets;
+  const [itemRows, paymentRows, chargeRows, invoiceRows, settlementRows] = detailRes.recordsets;
+
+  const mappedPayments = paymentRows.map((p) => ({
+    id: p.id,
+    paymentCode: p.paymentCode,
+    paymentMethod: p.paymentMethod,
+    providerOrderId: p.providerOrderId || null,
+    providerTransactionId: p.providerTransactionId || null,
+    amount: Number(p.amount || 0),
+    refundedAmount: Number(p.refundedAmount || 0),
+    currency: p.currency || "VND",
+    status: p.status,
+    failureCode: p.failureCode || null,
+    failureMessage: p.failureMessage || null,
+    paidAt: p.paidAt ? new Date(p.paidAt).toISOString() : null,
+    refundedAt: p.refundedAt ? new Date(p.refundedAt).toISOString() : null,
+    createdAt: p.createdAt ? new Date(p.createdAt).toISOString() : null,
+  }));
+
+  const prepaidAmount = mappedPayments.reduce((acc, p) => {
+    if (["SUCCESS", "PARTIALLY_REFUNDED", "REFUNDED"].includes(p.status)) {
+      return acc + Math.max(0, p.amount - p.refundedAmount);
+    }
+    return acc;
+  }, 0);
+
+  const mappedCharges = chargeRows.map((c) => ({
+    id: c.id,
+    category: c.category,
+    itemName: c.itemName,
+    unitLabel: c.unitLabel || "Lần",
+    quantity: Number(c.quantity),
+    unitPrice: Number(c.unitPrice || 0),
+    compensationMode: c.compensationMode || "NONE",
+    depreciationPercent: Number(c.depreciationPercent ?? 100),
+    adjustmentAmount: Number(c.adjustmentAmount || 0),
+    isTaxInclusive: Boolean(c.isTaxInclusive),
+    subtotalAmount: Number(c.subtotalAmount || 0),
+    taxRate: Number(c.taxRate || 0),
+    taxAmount: Number(c.taxAmount || 0),
+    totalAmount: Number(c.totalAmount || 0),
+    note: c.note || null,
+    evidenceImageUrl: c.evidenceImageUrl || null,
+    status: c.status,
+    createdAt: c.createdAt ? new Date(c.createdAt).toISOString() : null,
+  }));
+
+  const invRow = invoiceRows[0] || null;
+  const liveSummary = computeFolioSummary({
+    bookingOriginalTotal: booking.totalAmount,
+    prepaidAmount,
+    charges: mappedCharges,
+  });
+
+  const folioSummary =
+    invRow && invRow.settlementStatus === "SETTLED"
+      ? {
+          bookingOriginalTotal: Number(invRow.bookingOriginalTotal),
+          prepaidAmount: Number(invRow.prepaidAmount),
+          minibarTotal: Number(invRow.minibarTotal),
+          extraServiceTotal: Number(invRow.extraServiceTotal),
+          specialCleaningTotal: Number(invRow.specialCleaningTotal),
+          compensationTotal: Number(invRow.compensationTotal),
+          incidentalTaxTotal: Number(invRow.incidentalTaxTotal),
+          incidentalGrandTotal: Number(invRow.incidentalGrandTotal),
+          stayGrandTotal: Number(invRow.stayGrandTotal),
+          settlementDueAmount: Number(invRow.settlementDueAmount),
+          settlementPaidAmount: Number(invRow.settlementPaidAmount),
+        }
+      : {
+          ...liveSummary,
+          settlementPaidAmount: invRow ? Number(invRow.settlementPaidAmount || 0) : 0,
+        };
+
+  const mappedSettlements = settlementRows.map((sp) => ({
+    id: sp.id,
+    settlementCode: sp.settlementCode,
+    paymentMethod: sp.paymentMethod,
+    amount: Number(sp.amount || 0),
+    cashReceived:
+      sp.cashReceived === null || sp.cashReceived === undefined ? null : Number(sp.cashReceived),
+    cashChange:
+      sp.cashChange === null || sp.cashChange === undefined ? null : Number(sp.cashChange),
+    providerRef: sp.providerRef || null,
+    vnpTxnRef: sp.vnpTxnRef || null,
+    status: sp.status,
+    confirmedByName: sp.confirmedByName || null,
+    paidAt: sp.paidAt ? new Date(sp.paidAt).toISOString() : null,
+    note: sp.note || null,
+    createdAt: sp.createdAt ? new Date(sp.createdAt).toISOString() : null,
+  }));
+
+  const checkoutFolio =
+    invRow || mappedCharges.length > 0 || booking.checkedInAt || booking.checkedOutAt
+      ? {
+          invoice: invRow
+            ? {
+                id: invRow.id,
+                invoiceCode: invRow.invoiceCode,
+                settlementStatus: invRow.settlementStatus,
+                guestConfirmed: Boolean(invRow.guestConfirmed),
+                note: invRow.note || null,
+                settledByName: invRow.settledByName || null,
+                settledAt: invRow.settledAt ? new Date(invRow.settledAt).toISOString() : null,
+              }
+            : {
+                id: null,
+                invoiceCode: buildInvoiceCode(booking.id),
+                settlementStatus: booking.checkedOutAt ? "SETTLED" : "DRAFT",
+                guestConfirmed: Boolean(booking.checkedOutAt),
+                note: null,
+                settledByName: null,
+                settledAt: booking.checkedOutAt || null,
+              },
+          charges: mappedCharges,
+          summary: folioSummary,
+          settlementPayments: mappedSettlements,
+          settledPayment: mappedSettlements.find((s) => s.status === "SUCCESS") || null,
+          canPayOnlineVnpay:
+            booking.status === "CONFIRMED" &&
+            Boolean(booking.checkedInAt) &&
+            !booking.checkedOutAt &&
+            folioSummary.settlementDueAmount > 0 &&
+            invRow?.settlementStatus === "PENDING_PAYMENT",
+        }
+      : null;
 
   return {
     ...booking,
@@ -319,22 +536,8 @@ async function getCustomerBookingByCodeOrId(customerId, { bookingId, bookingCode
       discountAmount: Number(i.discountAmount || 0),
       totalAmount: Number(i.totalAmount || 0),
     })),
-    payments: paymentRows.map((p) => ({
-      id: p.id,
-      paymentCode: p.paymentCode,
-      paymentMethod: p.paymentMethod,
-      providerOrderId: p.providerOrderId || null,
-      providerTransactionId: p.providerTransactionId || null,
-      amount: Number(p.amount || 0),
-      refundedAmount: Number(p.refundedAmount || 0),
-      currency: p.currency || "VND",
-      status: p.status,
-      failureCode: p.failureCode || null,
-      failureMessage: p.failureMessage || null,
-      paidAt: p.paidAt ? new Date(p.paidAt).toISOString() : null,
-      refundedAt: p.refundedAt ? new Date(p.refundedAt).toISOString() : null,
-      createdAt: p.createdAt ? new Date(p.createdAt).toISOString() : null,
-    })),
+    payments: mappedPayments,
+    checkoutFolio,
   };
 }
 

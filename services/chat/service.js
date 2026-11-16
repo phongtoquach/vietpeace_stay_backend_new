@@ -20,7 +20,7 @@ const {
 const { appendSystemMessage, hardDeleteTemporaryConversation } = require("./lifecycle");
 
 const POLITE_HOME_GREETING =
-  "Xin chào Quý khách! Mình là Trợ lý ảo của VietPeace Stay. Rất hân hạnh được hỗ trợ Quý khách tìm điểm đến, gợi ý phòng phù hợp, báo giá và giải đáp thông tin lưu trú. Quý khách đang dự định đến thành phố hay điểm đến nào ạ? Ngoài ra, Quý khách cũng có thể nhấn Kết nối nhân viên / Quản lý bên dưới và chờ trong giây lát để trao đổi trực tiếp với nhân viên của chúng tôi nhé!";
+  "Xin chào! Mình là Trợ lý AI của VietPeace Stay. Bạn đang dự định đi đâu để mình gợi ý phòng và báo giá nhanh nhé? Nếu cần trao đổi trực tiếp, bạn hãy nhấn Kết nối Quản lý ở phía trên.";
 
 function buildActorSelfKeys(actor, originGuestSessionId = null) {
   if (!actor) return [];
@@ -31,7 +31,115 @@ function buildActorSelfKeys(actor, originGuestSessionId = null) {
   return [...new Set(keys.filter(Boolean))];
 }
 
-async function getFeaturedDestinations(limit = 8) {
+function applyPageContextToConversationCtx(prevCtx, verifiedPageContext) {
+  const safePrev = prevCtx && typeof prevCtx === "object" ? prevCtx : {};
+  const next = {
+    ...safePrev,
+    pageContext: verifiedPageContext,
+  };
+
+  if (verifiedPageContext?.pageType === "LOCATION_SEARCH" && verifiedPageContext.locationId) {
+    const newLocId = Number(verifiedPageContext.locationId);
+    const prevLocId = Number(safePrev?.activeLocation?.id || safePrev?.pageContext?.locationId || 0);
+    if (prevLocId && prevLocId !== newLocId && Array.isArray(safePrev.discussedAccommodations)) {
+      next.discussedAccommodations = safePrev.discussedAccommodations.filter(
+        (item) => Number(item.locationId) === newLocId,
+      );
+    }
+    next.activeLocation = {
+      id: newLocId,
+      name: verifiedPageContext.locationName || null,
+    };
+  } else if (verifiedPageContext?.pageType === "ACCOMMODATION_DETAIL" && verifiedPageContext.accommodationId) {
+    const accomId = Number(verifiedPageContext.accommodationId);
+    const newLocId = verifiedPageContext.locationId ? Number(verifiedPageContext.locationId) : null;
+    const prevLocId = Number(safePrev?.activeLocation?.id || safePrev?.pageContext?.locationId || 0);
+    let baseDiscussed = Array.isArray(safePrev.discussedAccommodations) ? safePrev.discussedAccommodations : [];
+    if (newLocId && prevLocId && prevLocId !== newLocId) {
+      baseDiscussed = baseDiscussed.filter((item) => Number(item.locationId) === newLocId);
+    }
+    const brief = {
+      accommodationId: accomId,
+      accommodationName: verifiedPageContext.accommodationName || "",
+      accommodationTypeName: verifiedPageContext.accommodationTypeName || null,
+      starRating: verifiedPageContext.starRating ?? null,
+      locationId: newLocId,
+      locationName: verifiedPageContext.locationName || null,
+      addressLine: verifiedPageContext.addressLine || null,
+      coverImage: verifiedPageContext.coverImage || null,
+      hasActiveManager: Boolean(verifiedPageContext.hasActiveManager),
+    };
+    const seen = new Set([accomId]);
+    const merged = [brief];
+    for (const item of baseDiscussed) {
+      const id = Number(item?.accommodationId);
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      merged.push(item);
+      if (merged.length >= 5) break;
+    }
+    next.discussedAccommodations = merged;
+    if (newLocId) {
+      next.activeLocation = {
+        id: newLocId,
+        name: verifiedPageContext.locationName || null,
+      };
+    }
+  }
+
+  return next;
+}
+
+function resolveUnifiedScopeForContext({
+  requestedScopeType = "PLATFORM",
+  requestedAccomId = null,
+  requestedBookingId = null,
+  verifiedPageContext,
+  existing = null,
+}) {
+  if (requestedScopeType === "PROPERTY" && requestedAccomId) {
+    return {
+      scopeType: "PROPERTY",
+      accommodationId: Number(requestedAccomId),
+      bookingId: requestedBookingId || null,
+    };
+  }
+  if (verifiedPageContext?.pageType === "ACCOMMODATION_DETAIL" && verifiedPageContext.accommodationId) {
+    return {
+      scopeType: "PROPERTY",
+      accommodationId: Number(verifiedPageContext.accommodationId),
+      bookingId: requestedBookingId || null,
+    };
+  }
+  if (verifiedPageContext?.pageType === "BOOKING_DETAIL" && verifiedPageContext.bookingId) {
+    return {
+      scopeType: verifiedPageContext.accommodationId ? "PROPERTY" : "PLATFORM",
+      accommodationId: verifiedPageContext.accommodationId ? Number(verifiedPageContext.accommodationId) : null,
+      bookingId: Number(verifiedPageContext.bookingId),
+    };
+  }
+  if (verifiedPageContext?.pageType === "LOCATION_SEARCH") {
+    return {
+      scopeType: "PLATFORM",
+      accommodationId: null,
+      bookingId: requestedBookingId || null,
+    };
+  }
+  if (existing) {
+    return {
+      scopeType: existing.scopeType,
+      accommodationId: existing.accommodationId ? Number(existing.accommodationId) : null,
+      bookingId: existing.bookingId ? Number(existing.bookingId) : null,
+    };
+  }
+  return {
+    scopeType: requestedScopeType === "PROPERTY" && requestedAccomId ? "PROPERTY" : "PLATFORM",
+    accommodationId: requestedScopeType === "PROPERTY" && requestedAccomId ? Number(requestedAccomId) : null,
+    bookingId: requestedBookingId || null,
+  };
+}
+
+async function getFeaturedDestinations(limit = 6) {
   const pool = getDBPool();
   const res = await pool
     .request()
@@ -83,7 +191,8 @@ async function resolveVerifiedPageContext(rawContext = {}, actor = null) {
   const adults = Number.isSafeInteger(Number(rawContext?.adults)) && Number(rawContext.adults) > 0
     ? Number(rawContext.adults)
     : null;
-  const children = Number.isSafeInteger(Number(rawContext?.children)) && Number(rawContext.children) >= 0
+  const children = rawContext?.children !== null && rawContext?.children !== undefined && rawContext?.children !== "" &&
+    Number.isSafeInteger(Number(rawContext.children)) && Number(rawContext.children) >= 0
     ? Number(rawContext.children)
     : null;
 
@@ -168,7 +277,7 @@ async function resolveVerifiedPageContext(rawContext = {}, actor = null) {
         rooms,
         adults,
         children,
-        contextKey: `PROPERTY:${prop.id}:${checkin || ""}:${checkout || ""}`,
+        contextKey: `PROPERTY:${prop.id}:${checkin || ""}:${checkout || ""}:${rooms || ""}:${adults || ""}:${children ?? ""}`,
       };
     }
   }
@@ -234,7 +343,7 @@ async function resolveVerifiedPageContext(rawContext = {}, actor = null) {
         rooms,
         adults,
         children,
-        contextKey: `LOCATION:${loc.id}:${checkin || ""}:${checkout || ""}`,
+        contextKey: `LOCATION:${loc.id}:${checkin || ""}:${checkout || ""}:${rooms || ""}:${adults || ""}:${children ?? ""}`,
       };
     }
   }
@@ -274,7 +383,7 @@ function buildContextGreetingAndCard(verifiedCtx, featuredLocations = []) {
   if (verifiedCtx.pageType === "ACCOMMODATION_DETAIL" && verifiedCtx.accommodationId) {
     return {
       greetingText:
-        `Xin chào Quý khách! Mình là Trợ lý ảo của VietPeace Stay. Mình đã đính kèm thông tin ${verifiedCtx.accommodationName} bên dưới để tiện hỗ trợ Quý khách kiểm tra phòng trống, báo giá và chính sách. Quý khách cần tư vấn gì, hoặc muốn kết nối trực tiếp với nhân viên / Quản lý của ${verifiedCtx.accommodationName} thì nhấn nút kết nối bên dưới và chờ trong giây lát nhé!`,
+        `Xin chào! Mình đã ghim thông tin ${verifiedCtx.accommodationName} bên dưới. Bạn cần kiểm tra phòng trống, báo giá hay nhấn Kết nối Quản lý để trao đổi trực tiếp nhé?`,
       cardMessage: {
         messageType: "PROPERTY_CARD",
         visibility: "PUBLIC",
@@ -307,7 +416,7 @@ function buildContextGreetingAndCard(verifiedCtx, featuredLocations = []) {
   if (verifiedCtx.pageType === "LOCATION_SEARCH" && verifiedCtx.locationId) {
     return {
       greetingText:
-        `Xin chào Quý khách! Mình là Trợ lý ảo của VietPeace Stay. Mình thấy Quý khách đang quan tâm khu vực ${verifiedCtx.locationName} — dưới đây là các cơ sở lưu trú phù hợp để Quý khách lựa chọn. Quý khách có thể hỏi mình về phòng, giá, chính sách hoặc chọn một cơ sở bên dưới để tư vấn chi tiết / kết nối trực tiếp với Quản lý cơ sở và chờ trong giây lát ạ!`,
+        `Dưới đây là các cơ sở gợi ý tại ${verifiedCtx.locationName}. Bạn cần hỏi phòng, báo giá hay gặp trực tiếp Quản lý cơ sở nào cứ chọn bên dưới nhé!`,
       cardMessage: {
         messageType: "PROPERTY_CARD",
         visibility: "PUBLIC",
@@ -330,7 +439,7 @@ function buildContextGreetingAndCard(verifiedCtx, featuredLocations = []) {
   if (verifiedCtx.pageType === "BOOKING_DETAIL" && verifiedCtx.bookingId) {
     return {
       greetingText:
-        `Xin chào Quý khách! Mình là Trợ lý ảo của VietPeace Stay. Mình đã xác thực đơn đặt phòng ${verifiedCtx.bookingCode} tại ${verifiedCtx.accommodationName} của bạn — bạn cần hỗ trợ thông tin gì cho đơn này ạ?`,
+        `Xin chào! Mình đã ghi nhận đơn #${verifiedCtx.bookingCode} tại ${verifiedCtx.accommodationName}. Bạn cần mình hỗ trợ thông tin gì cho đặt phòng này ạ?`,
       cardMessage: {
         messageType: "PROPERTY_CARD",
         visibility: "OWNER_ONLY",
@@ -517,6 +626,8 @@ async function formatConversationRow(row, selfKeys = [], pool = getDBPool()) {
     handoffStatus: row.handoffStatus || null,
     handoffFirstHumanReplyAt: row.handoffFirstHumanReplyAt ? new Date(row.handoffFirstHumanReplyAt).toISOString() : null,
     hasRatedHandoff: Boolean(row.hasRatedHandoff),
+    pendingRatingHandoffId: row.pendingRatingHandoffId ? Number(row.pendingRatingHandoffId) : null,
+    pendingRatingManagerName: row.pendingRatingManagerName || null,
     controlRevision: Number(row.controlRevision),
     lastSequence: Number(row.lastSequence),
     lastMessageAt: row.lastMessageAt ? new Date(row.lastMessageAt).toISOString() : null,
@@ -571,6 +682,8 @@ const CONV_SELECT_SQL = `
     h.status AS handoffStatus,
     h.first_human_reply_at AS handoffFirstHumanReplyAt,
     CASE WHEN r.id IS NOT NULL THEN CAST(1 AS BIT) ELSE CAST(0 AS BIT) END AS hasRatedHandoff,
+    pr.pendingRatingHandoffId,
+    pr.pendingRatingManagerName,
     c.manager_assignment_epoch_id AS managerAssignmentEpochId,
     c.control_revision AS controlRevision,
     c.last_sequence AS lastSequence,
@@ -592,7 +705,307 @@ const CONV_SELECT_SQL = `
   LEFT JOIN dbo.users AS u ON u.id = c.assigned_user_id
   LEFT JOIN dbo.chat_handoff_sessions AS h ON h.id = c.current_handoff_id
   LEFT JOIN dbo.chat_conversation_ratings AS r ON r.handoff_id = h.id
+  OUTER APPLY (
+    SELECT TOP 1
+      hp.id AS pendingRatingHandoffId,
+      hu.full_name AS pendingRatingManagerName
+    FROM dbo.chat_handoff_sessions AS hp
+    LEFT JOIN dbo.users AS hu ON hu.id = hp.manager_user_id
+    WHERE (
+        hp.conversation_id = c.id
+        OR (
+          c.source_conversation_id IS NOT NULL
+          AND hp.conversation_id = c.source_conversation_id
+          AND hp.ended_at >= DATEADD(hour, -24, SYSUTCDATETIME())
+        )
+      )
+      AND hp.first_human_reply_at IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM dbo.chat_conversation_ratings rr WHERE rr.handoff_id = hp.id
+      )
+    ORDER BY hp.id DESC
+  ) AS pr
 `;
+
+/**
+ * Merge/carry PUBLIC & OWNER_ONLY messages chronologically from source conversations
+ * into targetCid while preserving targetCid message IDs and remapping sequence cursors.
+ */
+async function syncMessagesFromSourceConversationsTx(
+  tx,
+  { targetCid, sourceCids = [], resolveSources = false, markOwnerReadSynced = false } = {},
+) {
+  const cleanTargetCid = Number(targetCid);
+  const cleanSourceCids = [...new Set(sourceCids.map(Number).filter((id) => Number.isSafeInteger(id) && id > 0 && id !== cleanTargetCid))];
+  if (!Number.isSafeInteger(cleanTargetCid) || cleanTargetCid < 1 || cleanSourceCids.length === 0) {
+    return { insertedCount: 0, totalSequence: 0 };
+  }
+
+  await lockConversationsInOrder(tx, [cleanTargetCid, ...cleanSourceCids]);
+
+  const targetRes = await newRequest(tx)
+    .input("cid", sqlObj.BigInt, cleanTargetCid)
+    .query(`
+      SELECT id, last_sequence AS lastSequence, last_message_preview AS lastMessagePreview, last_message_at AS lastMessageAt
+      FROM dbo.chat_conversations
+      WHERE id = @cid;
+    `);
+  if (!targetRes.recordset[0]) return { insertedCount: 0, totalSequence: 0 };
+
+  const existingMsgsRes = await newRequest(tx)
+    .input("cid", sqlObj.BigInt, cleanTargetCid)
+    .query(`
+      SELECT id, sequence, sender_actor_key AS senderActorKey, sender_type AS senderType,
+             message_type AS messageType, visibility, content, client_message_id AS clientMessageId, created_at AS createdAt
+      FROM dbo.chat_messages
+      WHERE conversation_id = @cid
+      ORDER BY sequence ASC, id ASC;
+    `);
+
+  const srcMsgsRes = await newRequest(tx)
+    .input("idsJson", sqlObj.NVarChar(sqlObj.MAX), JSON.stringify(cleanSourceCids))
+    .query(`
+      SELECT TOP 200
+        id, conversation_id AS conversationId, sequence,
+        sender_actor_key AS senderActorKey, sender_type AS senderType,
+        sender_user_id AS senderUserId, sender_guest_session_id AS senderGuestSessionId,
+        client_message_id AS clientMessageId, message_type AS messageType, visibility,
+        content, payload_json AS payloadJson, handoff_id AS handoffId, created_at AS createdAt
+      FROM dbo.chat_messages
+      WHERE conversation_id IN (SELECT TRY_CAST(value AS BIGINT) FROM OPENJSON(@idsJson))
+        AND visibility IN ('PUBLIC', 'OWNER_ONLY')
+      ORDER BY created_at DESC, id DESC;
+    `);
+
+  const srcRows = srcMsgsRes.recordset.reverse();
+  if (srcRows.length > 0 || resolveSources) {
+    const existingRows = existingMsgsRes.recordset;
+    const seenClientKeys = new Set(
+      existingRows
+        .filter((r) => r.clientMessageId)
+        .map((r) => `${r.senderActorKey}::${r.clientMessageId}`),
+    );
+    let hasPoliteGreeting = existingRows.some(
+      (r) => r.senderType === "AI" && r.messageType === "TEXT" && r.content === POLITE_HOME_GREETING,
+    );
+
+    const acceptedExt = [];
+    for (const m of srcRows) {
+      if (m.senderType === "AI" && m.messageType === "TEXT" && m.content === POLITE_HOME_GREETING) {
+        if (hasPoliteGreeting) continue;
+        hasPoliteGreeting = true;
+      }
+      if (m.clientMessageId) {
+        const ck = `${m.senderActorKey}::${m.clientMessageId}`;
+        if (seenClientKeys.has(ck)) continue;
+        seenClientKeys.add(ck);
+      }
+      acceptedExt.push(m);
+    }
+
+    if (acceptedExt.length > 0) {
+      const combined = [
+        ...existingRows.map((r) => ({
+          kind: "TARGET",
+          row: r,
+          ts: new Date(r.createdAt).getTime(),
+          convId: cleanTargetCid,
+          seq: Number(r.sequence),
+          id: Number(r.id),
+        })),
+        ...acceptedExt.map((r) => ({
+          kind: "EXT",
+          row: r,
+          ts: new Date(r.createdAt).getTime(),
+          convId: Number(r.conversationId),
+          seq: Number(r.sequence),
+          id: Number(r.id),
+        })),
+      ].sort((a, b) => a.ts - b.ts || (a.kind === "TARGET" ? 0 : 1) - (b.kind === "TARGET" ? 0 : 1) || a.convId - b.convId || a.seq - b.seq || a.id - b.id);
+
+      const oldTargetSeqToNewSeq = new Map();
+      let resequenceNeeded = false;
+      combined.forEach((item, idx) => {
+        const newSeq = idx + 1;
+        item.newSeq = newSeq;
+        if (item.kind === "TARGET") {
+          oldTargetSeqToNewSeq.set(item.seq, newSeq);
+          if (item.seq !== newSeq) resequenceNeeded = true;
+        }
+      });
+
+      if (resequenceNeeded) {
+        await newRequest(tx)
+          .input("cid", sqlObj.BigInt, cleanTargetCid)
+          .query(`UPDATE dbo.chat_messages SET sequence = sequence + 1000000 WHERE conversation_id = @cid;`);
+
+        for (const item of combined) {
+          if (item.kind === "TARGET") {
+            await newRequest(tx)
+              .input("mid", sqlObj.BigInt, item.id)
+              .input("newSeq", sqlObj.BigInt, item.newSeq)
+              .query(`UPDATE dbo.chat_messages SET sequence = @newSeq WHERE id = @mid;`);
+          }
+        }
+      }
+
+      for (const item of combined) {
+        if (item.kind !== "EXT") continue;
+        const m = item.row;
+        await newRequest(tx)
+          .input("tCid", sqlObj.BigInt, cleanTargetCid)
+          .input("seq", sqlObj.BigInt, item.newSeq)
+          .input("sKey", sqlObj.VarChar(100), m.senderActorKey)
+          .input("sType", sqlObj.VarChar(20), m.senderType)
+          .input("sUid", sqlObj.UniqueIdentifier, m.senderUserId || null)
+          .input("sGid", sqlObj.UniqueIdentifier, m.senderGuestSessionId || null)
+          .input("cMsgId", sqlObj.VarChar(100), m.clientMessageId || null)
+          .input("mType", sqlObj.VarChar(32), m.messageType)
+          .input("vis", sqlObj.VarChar(16), m.visibility)
+          .input("content", sqlObj.NVarChar(sqlObj.MAX), m.content)
+          .input("payloadJson", sqlObj.NVarChar(sqlObj.MAX), m.payloadJson || null)
+          .input("hid", sqlObj.BigInt, m.handoffId ? Number(m.handoffId) : null)
+          .input("createdAt", sqlObj.DateTime2(3), m.createdAt)
+          .query(`
+            INSERT INTO dbo.chat_messages (
+              conversation_id, sequence, sender_actor_key, sender_type,
+              sender_user_id, sender_guest_session_id, client_message_id,
+              message_type, visibility, content, payload_json, handoff_id, created_at
+            )
+            VALUES (
+              @tCid, @seq, @sKey, @sType,
+              @sUid, @sGid, @cMsgId,
+              @mType, @vis, @content, @payloadJson, @hid, @createdAt
+            );
+          `);
+      }
+
+      const sortedOldTargetSeqs = existingRows.map((r) => Number(r.sequence)).sort((a, b) => a - b);
+      const totalSeq = combined.length;
+      const mapCeilingSeq = (oldSeq) => {
+        const n = Number(oldSeq || 0);
+        if (n <= 0) return 0;
+        for (const s of sortedOldTargetSeqs) {
+          if (s >= n) return oldTargetSeqToNewSeq.get(s) || totalSeq + 1;
+        }
+        return totalSeq + 1;
+      };
+      const mapFloorSeq = (oldSeq) => {
+        const n = Number(oldSeq || 0);
+        if (n <= 0) return 0;
+        let mapped = 0;
+        for (const s of sortedOldTargetSeqs) {
+          if (s <= n) mapped = oldTargetSeqToNewSeq.get(s) || mapped;
+          else break;
+        }
+        return mapped;
+      };
+
+      if (resequenceNeeded) {
+        const hsRes = await newRequest(tx)
+          .input("cid", sqlObj.BigInt, cleanTargetCid)
+          .query(`SELECT id, visible_from_sequence AS visFrom FROM dbo.chat_handoff_sessions WHERE conversation_id = @cid;`);
+        for (const h of hsRes.recordset) {
+          const nextVis = mapCeilingSeq(h.visFrom);
+          await newRequest(tx)
+            .input("hid", sqlObj.BigInt, Number(h.id))
+            .input("visFrom", sqlObj.BigInt, nextVis)
+            .query(`UPDATE dbo.chat_handoff_sessions SET visible_from_sequence = @visFrom WHERE id = @hid;`);
+        }
+
+        const psRes = await newRequest(tx)
+          .input("cid", sqlObj.BigInt, cleanTargetCid)
+          .query(`
+            SELECT id, participant_role AS role,
+                   visible_from_sequence AS visFrom,
+                   visible_until_sequence AS visUntil,
+                   last_delivered_sequence AS deliv,
+                   last_read_sequence AS [read]
+            FROM dbo.chat_participants
+            WHERE conversation_id = @cid;
+          `);
+        for (const p of psRes.recordset) {
+          const nextVisFrom = mapCeilingSeq(p.visFrom);
+          const nextVisUntil = p.visUntil !== null && p.visUntil !== undefined ? mapFloorSeq(p.visUntil) : null;
+          let nextDeliv = mapFloorSeq(p.deliv);
+          let nextRead = Math.min(nextDeliv, mapFloorSeq(p.read));
+          if (p.role === "CUSTOMER" || p.role === "GUEST") {
+            nextDeliv = Math.max(nextDeliv, totalSeq);
+            nextRead = Math.min(nextDeliv, totalSeq);
+          }
+          await newRequest(tx)
+            .input("pid", sqlObj.BigInt, Number(p.id))
+            .input("vf", sqlObj.BigInt, nextVisFrom)
+            .input("vu", sqlObj.BigInt, nextVisUntil)
+            .input("ld", sqlObj.BigInt, nextDeliv)
+            .input("lr", sqlObj.BigInt, nextRead)
+            .query(`
+              UPDATE dbo.chat_participants
+              SET visible_from_sequence = @vf,
+                  visible_until_sequence = @vu,
+                  last_delivered_sequence = @ld,
+                  last_read_sequence = @lr
+              WHERE id = @pid;
+            `);
+        }
+      } else if (markOwnerReadSynced) {
+        await newRequest(tx)
+          .input("cid", sqlObj.BigInt, cleanTargetCid)
+          .input("seq", sqlObj.BigInt, totalSeq)
+          .query(`
+            UPDATE dbo.chat_participants
+            SET last_delivered_sequence = CASE WHEN last_delivered_sequence < @seq THEN @seq ELSE last_delivered_sequence END,
+                last_read_sequence = CASE WHEN last_read_sequence < @seq THEN @seq ELSE last_read_sequence END
+            WHERE conversation_id = @cid AND participant_role IN ('CUSTOMER', 'GUEST');
+          `);
+      }
+
+      const lastPublic = [...combined].reverse().find((i) => i.row.visibility === "PUBLIC") || combined[combined.length - 1];
+      const nextPreview = previewText(lastPublic?.row?.content || "");
+      const nextLastAt = combined[combined.length - 1].row.createdAt;
+
+      await newRequest(tx)
+        .input("cid", sqlObj.BigInt, cleanTargetCid)
+        .input("lastSeq", sqlObj.BigInt, totalSeq)
+        .input("preview", sqlObj.NVarChar(300), nextPreview)
+        .input("lastAt", sqlObj.DateTime2(3), nextLastAt)
+        .query(`
+          UPDATE dbo.chat_conversations
+          SET last_sequence = @lastSeq,
+              last_message_preview = @preview,
+              last_message_at = COALESCE(@lastAt, last_message_at),
+              control_revision = control_revision + 1,
+              updated_at = SYSUTCDATETIME()
+          WHERE id = @cid;
+        `);
+    }
+
+    if (resolveSources) {
+      await newRequest(tx)
+        .input("idsJson", sqlObj.NVarChar(sqlObj.MAX), JSON.stringify(cleanSourceCids))
+        .query(`
+          UPDATE dbo.chat_ai_runs
+          SET status = 'CANCELLED', completed_at = SYSUTCDATETIME()
+          WHERE conversation_id IN (SELECT TRY_CAST(value AS BIGINT) FROM OPENJSON(@idsJson))
+            AND status IN ('QUEUED', 'RUNNING');
+
+          UPDATE dbo.chat_conversations
+          SET status = 'RESOLVED',
+              resolved_at = SYSUTCDATETIME(),
+              ai_due_at = NULL,
+              control_revision = control_revision + 1,
+              updated_at = SYSUTCDATETIME()
+          WHERE id IN (SELECT TRY_CAST(value AS BIGINT) FROM OPENJSON(@idsJson))
+            AND status = 'OPEN'
+            AND handling_mode = 'AI';
+        `);
+    }
+
+    return { insertedCount: acceptedExt.length, totalSequence: existingRows.length + acceptedExt.length };
+  }
+
+  return { insertedCount: 0, totalSequence: Number(targetRes.recordset[0].lastSequence || 0) };
+}
 
 async function assertOwnerConversation(actor, conversationId, txOrPool = getDBPool()) {
   const cid = Number(conversationId);
@@ -622,24 +1035,62 @@ async function assertOwnerConversation(actor, conversationId, txOrPool = getDBPo
 async function listOwnerConversations(actor) {
   if (!actor) return [];
   const pool = getDBPool();
-  const res = await pool
-    .request()
-    .input("uid", sqlObj.UniqueIdentifier, actor.type === "CUSTOMER" ? actor.userId : null)
-    .input("gid", sqlObj.UniqueIdentifier, actor.type === "GUEST" ? actor.guestSessionId : null)
-    .query(`
-      ${CONV_SELECT_SQL}
-      WHERE (
-        (@uid IS NOT NULL AND c.customer_user_id = @uid)
-        OR (@gid IS NOT NULL AND c.guest_session_id = @gid)
-      )
-      ORDER BY CASE WHEN c.status = 'OPEN' THEN 0 ELSE 1 END, COALESCE(c.last_message_at, c.created_at) DESC, c.id DESC;
-    `);
+  const queryOwnerConvs = () =>
+    pool
+      .request()
+      .input("uid", sqlObj.UniqueIdentifier, actor.type === "CUSTOMER" ? actor.userId : null)
+      .input("gid", sqlObj.UniqueIdentifier, actor.type === "GUEST" ? actor.guestSessionId : null)
+      .query(`
+        ${CONV_SELECT_SQL}
+        WHERE (
+          (@uid IS NOT NULL AND c.customer_user_id = @uid)
+          OR (@gid IS NOT NULL AND c.guest_session_id = @gid)
+        )
+        ORDER BY
+          CASE WHEN c.status = 'OPEN' THEN 0 ELSE 1 END,
+          CASE
+            WHEN c.handling_mode = 'HUMAN' THEN 0
+            WHEN c.handling_mode = 'WAITING_HUMAN' THEN 1
+            ELSE 2
+          END,
+          COALESCE(c.last_message_at, c.created_at) DESC,
+          c.id DESC;
+      `);
 
-  const list = [];
-  for (const row of res.recordset) {
-    list.push(await formatConversationRow(row, buildActorSelfKeys(actor, row.originGuestSessionId), pool));
+  let res = await queryOwnerConvs();
+  const openRows = res.recordset.filter((r) => r.status === "OPEN");
+  if (openRows.length > 1) {
+    const primaryOpenId = Number(openRows[0].id);
+    const extraAiOpenIds = openRows
+      .slice(1)
+      .filter((r) => r.handlingMode === "AI")
+      .map((r) => Number(r.id));
+    if (extraAiOpenIds.length > 0) {
+      await withTransaction(async (tx) => {
+        if (actor.type === "CUSTOMER") {
+          await lockUsersInOrder(tx, [actor.userId]);
+        } else {
+          await lockGuestSessionsInOrder(tx, [actor.guestSessionId]);
+        }
+        await syncMessagesFromSourceConversationsTx(tx, {
+          targetCid: primaryOpenId,
+          sourceCids: extraAiOpenIds,
+          resolveSources: true,
+        });
+      });
+      res = await queryOwnerConvs();
+    }
   }
-  return list;
+
+  const primaryRow = res.recordset[0];
+  if (!primaryRow) return [];
+  return [
+    await formatConversationRow(
+      primaryRow,
+      buildActorSelfKeys(actor, primaryRow.originGuestSessionId),
+      pool,
+    ),
+  ];
 }
 
 async function getOwnerConversationDetail(actor, conversationId) {
@@ -715,7 +1166,7 @@ async function openOrReuseConversation(actor, body = {}) {
     actor,
   );
   const featuredLocations =
-    verifiedPageContext.pageType === "HOME" ? await getFeaturedDestinations(8) : [];
+    verifiedPageContext.pageType === "HOME" ? await getFeaturedDestinations(6) : [];
 
   const result = await withTransaction(async (tx) => {
     // Strict lock ordering: users -> chat_guest_sessions -> accommodations -> chat_conversations
@@ -751,60 +1202,153 @@ async function openOrReuseConversation(actor, body = {}) {
       }
     }
 
-    // Check existing OPEN conversation matching exact tuple
+    // Find single unified OPEN conversation for this actor (prioritize active HUMAN / WAITING_HUMAN)
     const existingRes = await newRequest(tx)
       .input("uid", sqlObj.UniqueIdentifier, actor.type === "CUSTOMER" ? actor.userId : null)
       .input("gid", sqlObj.UniqueIdentifier, actor.type === "GUEST" ? actor.guestSessionId : null)
-      .input("scope", sqlObj.VarChar(16), scopeType)
-      .input("accomId", sqlObj.Int, accommodationId)
-      .input("bookingId", sqlObj.BigInt, bookingId)
       .query(`
-        SELECT TOP 1
+        SELECT
           id,
+          scope_type AS scopeType,
+          accommodation_id AS accommodationId,
+          booking_id AS bookingId,
+          handling_mode AS handlingMode,
           last_sequence AS lastSequence,
           context_json AS contextJson,
           retention_state AS retentionState
         FROM dbo.chat_conversations WITH (UPDLOCK, HOLDLOCK)
         WHERE status = 'OPEN'
-          AND scope_type = @scope
-          AND ((accommodation_id IS NULL AND @accomId IS NULL) OR accommodation_id = @accomId)
-          AND ((booking_id IS NULL AND @bookingId IS NULL) OR booking_id = @bookingId)
           AND (
             (@uid IS NOT NULL AND customer_user_id = @uid)
             OR (@gid IS NOT NULL AND guest_session_id = @gid)
-          );
+          )
+        ORDER BY
+          CASE
+            WHEN handling_mode = 'HUMAN' THEN 0
+            WHEN handling_mode = 'WAITING_HUMAN' THEN 1
+            ELSE 2
+          END,
+          COALESCE(last_message_at, created_at) DESC,
+          id DESC;
       `);
 
     const existing = existingRes.recordset[0];
+    const extraOpenIds = existingRes.recordset
+      .slice(1)
+      .filter((r) => r.handlingMode === "AI")
+      .map((r) => Number(r.id));
+
+    if (existing && extraOpenIds.length > 0) {
+      await syncMessagesFromSourceConversationsTx(tx, {
+        targetCid: Number(existing.id),
+        sourceCids: extraOpenIds,
+        resolveSources: true,
+      });
+    }
+
     let cid;
     let isCreated = false;
+    let hasCarriedHistory = false;
     let prevCtx = {};
 
     if (existing) {
       cid = Number(existing.id);
+      await lockConversationsInOrder(tx, [cid]);
       prevCtx = parseJsonSafe(existing.contextJson, {}) || {};
+
+      // Keep active Manager handoff / conversation strictly untouched until returned to AI
+      if (existing.handlingMode !== "AI") {
+        if (clientRequestId) {
+          await recordChatEvent(tx, {
+            conversationId: cid,
+            actorKey: actor.actorKey,
+            eventType: "OPEN_REQUEST_RESULT",
+            clientRequestId,
+            payload: {
+              scopeType: existing.scopeType,
+              accommodationId: existing.accommodationId,
+              preservedHumanHandoff: true,
+            },
+          }).catch(() => {});
+        }
+        return { conversationId: cid, created: false };
+      }
+
+      const targetScope = resolveUnifiedScopeForContext({
+        requestedScopeType: scopeType,
+        requestedAccomId: accommodationId,
+        requestedBookingId: bookingId,
+        verifiedPageContext,
+        existing,
+      });
+      const updatedCtx = applyPageContextToConversationCtx(prevCtx, verifiedPageContext);
+
+      await newRequest(tx)
+        .input("cid", sqlObj.BigInt, cid)
+        .input("scope", sqlObj.VarChar(16), targetScope.scopeType)
+        .input("accomId", sqlObj.Int, targetScope.accommodationId)
+        .input("bookingId", sqlObj.BigInt, targetScope.bookingId)
+        .input("ctxJson", sqlObj.NVarChar(sqlObj.MAX), JSON.stringify(updatedCtx))
+        .query(`
+          UPDATE dbo.chat_conversations
+          SET scope_type = @scope,
+              accommodation_id = @accomId,
+              booking_id = @bookingId,
+              manager_assignment_epoch_id = NULL,
+              context_json = @ctxJson,
+              updated_at = SYSUTCDATETIME()
+          WHERE id = @cid;
+        `);
     } else {
+      // Carry forward full AI + Manager conversation history if a prior unified conversation was resolved
+      const prevResolvedRes = await newRequest(tx)
+        .input("uid", sqlObj.UniqueIdentifier, actor.type === "CUSTOMER" ? actor.userId : null)
+        .input("gid", sqlObj.UniqueIdentifier, actor.type === "GUEST" ? actor.guestSessionId : null)
+        .query(`
+          SELECT TOP 1 id, context_json AS contextJson
+          FROM dbo.chat_conversations WITH (UPDLOCK, HOLDLOCK)
+          WHERE status = 'RESOLVED'
+            AND (
+              (@uid IS NOT NULL AND customer_user_id = @uid)
+              OR (@gid IS NOT NULL AND guest_session_id = @gid)
+            )
+          ORDER BY COALESCE(last_message_at, updated_at, created_at) DESC, id DESC;
+        `);
+      const prevResolved = prevResolvedRes.recordset[0] || null;
+      const prevResolvedId = prevResolved ? Number(prevResolved.id) : null;
+      const prevResolvedCtx = prevResolved ? parseJsonSafe(prevResolved.contextJson, {}) || {} : {};
+
+      const targetScope = resolveUnifiedScopeForContext({
+        requestedScopeType: scopeType,
+        requestedAccomId: accommodationId,
+        requestedBookingId: bookingId,
+        verifiedPageContext,
+        existing: null,
+      });
       const retentionState = actor.type === "CUSTOMER" ? "PERSISTENT" : "TEMPORARY";
-      const initCtx = {
-        pageContext: verifiedPageContext,
-      };
+      const seedCtx = prevResolvedCtx?.lastAttachedContextKey
+        ? { lastAttachedContextKey: prevResolvedCtx.lastAttachedContextKey }
+        : {};
+      prevCtx = seedCtx;
+      const initCtx = applyPageContextToConversationCtx(seedCtx, verifiedPageContext);
       const insConv = await newRequest(tx)
         .input("uid", sqlObj.UniqueIdentifier, actor.type === "CUSTOMER" ? actor.userId : null)
         .input("gid", sqlObj.UniqueIdentifier, actor.type === "GUEST" ? actor.guestSessionId : null)
-        .input("scope", sqlObj.VarChar(16), scopeType)
-        .input("accomId", sqlObj.Int, accommodationId)
-        .input("bookingId", sqlObj.BigInt, bookingId)
+        .input("srcCid", sqlObj.BigInt, prevResolvedId)
+        .input("scope", sqlObj.VarChar(16), targetScope.scopeType)
+        .input("accomId", sqlObj.Int, targetScope.accommodationId)
+        .input("bookingId", sqlObj.BigInt, targetScope.bookingId)
         .input("ctxJson", sqlObj.NVarChar(sqlObj.MAX), JSON.stringify(initCtx))
         .input("ret", sqlObj.VarChar(16), retentionState)
         .input("tempSec", sqlObj.Int, config.guestTempCleanupSeconds)
         .query(`
           INSERT INTO dbo.chat_conversations (
-            customer_user_id, guest_session_id, scope_type, accommodation_id, booking_id,
+            customer_user_id, guest_session_id, source_conversation_id, scope_type, accommodation_id, booking_id,
             context_json, retention_state, temporary_cleanup_at
           )
           OUTPUT INSERTED.id
           VALUES (
-            @uid, @gid, @scope, @accomId, @bookingId,
+            @uid, @gid, @srcCid, @scope, @accomId, @bookingId,
             @ctxJson, @ret,
             CASE WHEN @ret = 'TEMPORARY' THEN DATEADD(second, @tempSec, SYSUTCDATETIME()) ELSE NULL END
           );
@@ -825,34 +1369,31 @@ async function openOrReuseConversation(actor, body = {}) {
           )
           VALUES (@cid, @actorKey, @uid, @gid, @role);
         `);
-    }
 
-    // Update pageContext & attach initial greeting or deduped Shopee/Location card if requested
-    const updatedCtx = {
-      ...prevCtx,
-      pageContext: verifiedPageContext,
-    };
-    await newRequest(tx)
-      .input("cid", sqlObj.BigInt, cid)
-      .input("ctxJson", sqlObj.NVarChar(sqlObj.MAX), JSON.stringify(updatedCtx))
-      .query(`
-        UPDATE dbo.chat_conversations
-        SET context_json = @ctxJson, updated_at = SYSUTCDATETIME()
-        WHERE id = @cid;
-      `);
+      if (prevResolvedId) {
+        const carryRes = await syncMessagesFromSourceConversationsTx(tx, {
+          targetCid: cid,
+          sourceCids: [prevResolvedId],
+          resolveSources: false,
+          markOwnerReadSynced: true,
+        });
+        hasCarriedHistory = Number(carryRes.insertedCount || 0) > 0;
+      }
+    }
 
     const attachRequested = rawPageContext?.attachContextCard !== false;
     const sameKeyAlreadyAttached =
       prevCtx?.lastAttachedContextKey &&
       prevCtx.lastAttachedContextKey === verifiedPageContext.contextKey;
+    const shouldGreetFresh = isCreated && !hasCarriedHistory;
 
-    if (isCreated || (attachRequested && !sameKeyAlreadyAttached)) {
+    if (shouldGreetFresh || (attachRequested && !sameKeyAlreadyAttached && verifiedPageContext.contextKey !== "HOME")) {
       const { greetingText, cardMessage } = buildContextGreetingAndCard(
         verifiedPageContext,
         featuredLocations,
       );
       const msgs = await insertGreetingMessagesInTx(tx, cid, {
-        greetingText: isCreated ? greetingText : null,
+        greetingText: shouldGreetFresh ? greetingText : null,
         cardMessage,
         contextKey: verifiedPageContext.contextKey,
       });
@@ -894,10 +1435,13 @@ async function updateConversationContext(actor, conversationId, rawPageContext =
   if (existingRow.status !== "OPEN") {
     throw chatError(409, "CONVERSATION_RESOLVED", "Hội thoại đã kết thúc.");
   }
+  if (existingRow.handlingMode !== "AI") {
+    return getOwnerConversationDetail(actor, conversationId);
+  }
 
   const verifiedPageContext = await resolveVerifiedPageContext(rawPageContext, actor);
   const featuredLocations =
-    verifiedPageContext.pageType === "HOME" ? await getFeaturedDestinations(8) : [];
+    verifiedPageContext.pageType === "HOME" ? await getFeaturedDestinations(6) : [];
 
   await withTransaction(async (tx) => {
     const cid = Number(conversationId);
@@ -905,20 +1449,43 @@ async function updateConversationContext(actor, conversationId, rawPageContext =
 
     const curRes = await newRequest(tx)
       .input("cid", sqlObj.BigInt, cid)
-      .query(`SELECT context_json AS contextJson, scope_type AS scopeType, accommodation_id AS accommodationId FROM dbo.chat_conversations WHERE id = @cid;`);
+      .query(`
+        SELECT
+          context_json AS contextJson,
+          scope_type AS scopeType,
+          accommodation_id AS accommodationId,
+          booking_id AS bookingId,
+          handling_mode AS handlingMode
+        FROM dbo.chat_conversations
+        WHERE id = @cid;
+      `);
     const cur = curRes.recordset[0];
-    const prevCtx = parseJsonSafe(cur?.contextJson, {}) || {};
+    if (!cur || cur.handlingMode !== "AI") return;
 
-    const nextCtx = {
-      ...prevCtx,
-      pageContext: verifiedPageContext,
-    };
+    const prevCtx = parseJsonSafe(cur?.contextJson, {}) || {};
+    const nextCtx = applyPageContextToConversationCtx(prevCtx, verifiedPageContext);
+    const targetScope = resolveUnifiedScopeForContext({
+      requestedScopeType: verifiedPageContext.pageType === "ACCOMMODATION_DETAIL" ? "PROPERTY" : "PLATFORM",
+      requestedAccomId: verifiedPageContext.accommodationId || null,
+      requestedBookingId: verifiedPageContext.bookingId || null,
+      verifiedPageContext,
+      existing: cur,
+    });
+
     await newRequest(tx)
       .input("cid", sqlObj.BigInt, cid)
+      .input("scope", sqlObj.VarChar(16), targetScope.scopeType)
+      .input("accomId", sqlObj.Int, targetScope.accommodationId)
+      .input("bookingId", sqlObj.BigInt, targetScope.bookingId)
       .input("ctxJson", sqlObj.NVarChar(sqlObj.MAX), JSON.stringify(nextCtx))
       .query(`
         UPDATE dbo.chat_conversations
-        SET context_json = @ctxJson, updated_at = SYSUTCDATETIME()
+        SET scope_type = @scope,
+            accommodation_id = @accomId,
+            booking_id = @bookingId,
+            manager_assignment_epoch_id = NULL,
+            context_json = @ctxJson,
+            updated_at = SYSUTCDATETIME()
         WHERE id = @cid;
       `);
 
@@ -1129,7 +1696,7 @@ async function sendOwnerMessage(actor, conversationId, { content, clientMessageI
  * Customer/Guest explicitly requests connection to the accommodation's Manager (5-minute timeout).
  * Rejects auto-escalation from PLATFORM without picking accommodation first.
  */
-async function requestHumanSupport(actor, conversationId, { reason = null } = {}) {
+async function requestHumanSupport(actor, conversationId, { reason = null, accommodationId = null } = {}) {
   const cid = Number(conversationId);
   const result = await withTransaction(async (tx) => {
     await lockConversationsInOrder(tx, [cid]);
@@ -1144,6 +1711,9 @@ async function requestHumanSupport(actor, conversationId, { reason = null } = {}
         "PROPERTY_SELECTION_REQUIRED",
         "Vui lòng chọn Điểm đến và Cơ sở lưu trú bạn muốn liên hệ trước khi kết nối với Quản lý.",
       );
+    }
+    if (accommodationId !== null && Number(accommodationId) !== Number(row.accommodationId)) {
+      throw chatError(409, "PROPERTY_CONTEXT_CHANGED", "Cơ sở tư vấn đã thay đổi. Vui lòng chọn lại cơ sở muốn gặp Quản lý.");
     }
     if (row.handlingMode === "HUMAN" || row.handlingMode === "WAITING_HUMAN") {
       return {
@@ -1217,14 +1787,62 @@ async function requestHumanSupport(actor, conversationId, { reason = null } = {}
     }
 
     // Compute visible_from_sequence protecting messages prior to current manager's assignment epoch
+    // AND isolating prior handoffs / carried-over episodes / other-accommodation cards inside the unified thread
     const seqEpochRes = await newRequest(tx)
       .input("cid", sqlObj.BigInt, cid)
+      .input("accomId", sqlObj.Int, accomId)
+      .input("reqActor", sqlObj.VarChar(100), actor.actorKey)
       .input("epochAssigned", sqlObj.DateTime2(3), activeMgr.assignedAtUtc)
       .query(`
-        SELECT COALESCE(
-          (SELECT MIN(sequence) FROM dbo.chat_messages WHERE conversation_id = @cid AND created_at >= @epochAssigned AND visibility = 'PUBLIC'),
-          (SELECT last_sequence + 1 FROM dbo.chat_conversations WHERE id = @cid)
-        ) AS visibleFromSeq;
+        SELECT MAX(v.seq) AS visibleFromSeq
+        FROM (
+          SELECT COALESCE(
+            (SELECT MIN(sequence) FROM dbo.chat_messages WHERE conversation_id = @cid AND created_at >= @epochAssigned AND visibility = 'PUBLIC'),
+            (SELECT last_sequence + 1 FROM dbo.chat_conversations WHERE id = @cid)
+          ) AS seq
+          UNION ALL
+          SELECT COALESCE(
+            (SELECT MAX(m.sequence) + 1
+             FROM dbo.chat_messages AS m
+             CROSS APPLY (
+               SELECT TOP 1 c2.created_at AS convCreatedAt
+               FROM dbo.chat_conversations AS c2
+               WHERE c2.id = @cid
+             ) AS curc
+             WHERE m.conversation_id = @cid
+               AND EXISTS (
+                 SELECT 1
+                 FROM dbo.chat_handoff_sessions AS h
+                 WHERE h.accommodation_id <> @accomId
+                   AND (
+                     m.handoff_id = h.id
+                     OR (
+                       h.conversation_id = @cid
+                       AND m.created_at <= COALESCE(h.ended_at, h.expires_at, h.requested_at)
+                     )
+                     OR (
+                       h.requested_by_actor_key = @reqActor
+                       AND m.created_at < curc.convCreatedAt
+                       AND m.created_at <= COALESCE(h.ended_at, h.expires_at, h.requested_at)
+                     )
+                   )
+               )),
+            1
+          )
+          UNION ALL
+          SELECT COALESCE(
+            (SELECT MAX(m.sequence) + 1
+             FROM dbo.chat_messages AS m
+             WHERE m.conversation_id = @cid
+               AND m.message_type IN ('PROPERTY_CARD', 'VERIFIED_BOOKING_CONTEXT')
+               AND ISJSON(m.payload_json) = 1
+               AND COALESCE(
+                 TRY_CAST(JSON_VALUE(m.payload_json, '$.accommodationId') AS INT),
+                 TRY_CAST(JSON_VALUE(m.payload_json, '$.accommodation.id') AS INT)
+               ) <> @accomId),
+            1
+          )
+        ) AS v;
       `);
     const visibleFromSeq = Number(seqEpochRes.recordset[0]?.visibleFromSeq || 1);
 
@@ -1360,11 +1978,15 @@ async function cancelHumanSupport(actor, conversationId) {
     const row = await assertOwnerConversation(actor, cid, tx);
     if (row.handlingMode !== "WAITING_HUMAN") return;
 
-    await newRequest(tx)
+    const cancelQuery = await newRequest(tx)
       .input("cid", sqlObj.BigInt, cid)
       .input("hid", sqlObj.BigInt, row.currentHandoffId || 0)
       .input("tempSec", sqlObj.Int, config.guestTempCleanupSeconds)
       .query(`
+        SELECT target_manager_user_id AS targetManagerUserId
+        FROM dbo.chat_handoff_sessions
+        WHERE id = @hid;
+
         UPDATE dbo.chat_handoff_sessions
         SET status = 'CANCELLED', ended_at = SYSUTCDATETIME(), ended_reason = 'CUSTOMER_CANCELLED'
         WHERE id = @hid AND status = 'PENDING';
@@ -1383,31 +2005,162 @@ async function cancelHumanSupport(actor, conversationId) {
         WHERE id = @cid;
       `);
 
+    const targetManagerUserId = cancelQuery.recordset?.[0]?.targetManagerUserId
+      ? String(cancelQuery.recordset[0].targetManagerUserId)
+      : null;
+
     const sysMsg = await appendSystemMessage(
       tx,
       cid,
       "Quý khách đã hủy yêu cầu chờ kết nối Quản lý. Trợ lý AI VietPeace Stay sẵn sàng tiếp tục hỗ trợ bạn ngay.",
+      row.currentHandoffId ? { handoffId: Number(row.currentHandoffId) } : {},
     );
 
     await enqueueOutbox(tx, {
       kind: "SOCKET_EVENT",
       conversationId: cid,
       eventName: "message:created",
-      payload: { conversationId: cid, ownerKey: actor.actorKey, message: sysMsg, visibility: "PUBLIC" },
+      payload: {
+        conversationId: cid,
+        ownerKey: actor.actorKey,
+        targetManagerUserId,
+        message: sysMsg,
+        visibility: "PUBLIC",
+      },
     });
 
     await enqueueOutbox(tx, {
       kind: "SOCKET_EVENT",
       conversationId: cid,
       eventName: "queue:updated",
-      payload: { accommodationId: row.accommodationId ? Number(row.accommodationId) : null, conversationId: cid, action: "CANCELLED" },
+      payload: {
+        accommodationId: row.accommodationId ? Number(row.accommodationId) : null,
+        managerUserId: targetManagerUserId,
+        conversationId: cid,
+        action: "CANCELLED",
+      },
     });
 
     await enqueueOutbox(tx, {
       kind: "SOCKET_EVENT",
       conversationId: cid,
       eventName: "conversation:updated",
-      payload: { conversationId: cid, handlingMode: "AI", currentHandoffId: null, managerWaitExpiresAt: null },
+      payload: {
+        conversationId: cid,
+        ownerKey: actor.actorKey,
+        targetManagerUserId,
+        handlingMode: "AI",
+        currentHandoffId: null,
+        managerWaitExpiresAt: null,
+      },
+    });
+  });
+
+  return getOwnerConversationDetail(actor, cid);
+}
+
+/**
+ * Customer or Guest exits live HUMAN Manager mode back to unified AI mode without splitting threads.
+ */
+async function returnOwnerConversationToAi(actor, conversationId) {
+  const cid = Number(conversationId);
+  await withTransaction(async (tx) => {
+    await lockConversationsInOrder(tx, [cid]);
+    const row = await assertOwnerConversation(actor, cid, tx);
+    if (row.status !== "OPEN" || row.handlingMode !== "HUMAN") return;
+
+    let pendingRatingHandoffId = null;
+    let pendingRatingManagerName = row.assignedManagerName || null;
+    let targetManagerUserId = row.assignedUserId ? String(row.assignedUserId) : null;
+
+    if (row.currentHandoffId) {
+      const hCheck = await newRequest(tx)
+        .input("hid", sqlObj.BigInt, row.currentHandoffId)
+        .query(`
+          SELECT TOP 1
+            h.id,
+            h.target_manager_user_id AS targetManagerUserId,
+            h.manager_user_id AS managerUserId,
+            u.full_name AS managerName,
+            h.first_human_reply_at AS firstHumanReplyAt,
+            CASE WHEN r.id IS NOT NULL THEN 1 ELSE 0 END AS alreadyRated
+          FROM dbo.chat_handoff_sessions AS h
+          LEFT JOIN dbo.users AS u ON u.id = COALESCE(h.manager_user_id, h.target_manager_user_id)
+          LEFT JOIN dbo.chat_conversation_ratings AS r ON r.handoff_id = h.id
+          WHERE h.id = @hid;
+
+          UPDATE dbo.chat_handoff_sessions
+          SET status = 'RESOLVED', ended_at = SYSUTCDATETIME(), ended_reason = 'CUSTOMER_RETURNED_TO_AI'
+          WHERE id = @hid AND status = 'CLAIMED';
+        `);
+      const hr = hCheck.recordset?.[0];
+      if (hr?.managerName) pendingRatingManagerName = hr.managerName;
+      if (!targetManagerUserId && (hr?.managerUserId || hr?.targetManagerUserId)) {
+        targetManagerUserId = String(hr.managerUserId || hr.targetManagerUserId);
+      }
+      if (hr?.firstHumanReplyAt && !hr.alreadyRated) {
+        pendingRatingHandoffId = Number(hr.id);
+      }
+    }
+
+    await newRequest(tx)
+      .input("cid", sqlObj.BigInt, cid)
+      .input("tempSec", sqlObj.Int, config.guestTempCleanupSeconds)
+      .query(`
+        UPDATE dbo.chat_conversations
+        SET handling_mode = 'AI',
+            assigned_user_id = NULL,
+            current_handoff_id = NULL,
+            manager_wait_expires_at = NULL,
+            temporary_cleanup_at = CASE
+              WHEN retention_state = 'TEMPORARY' AND customer_user_id IS NULL THEN DATEADD(second, @tempSec, SYSUTCDATETIME())
+              ELSE temporary_cleanup_at
+            END,
+            control_revision = control_revision + 1,
+            updated_at = SYSUTCDATETIME()
+        WHERE id = @cid;
+      `);
+
+    const sysMsg = await appendSystemMessage(
+      tx,
+      cid,
+      "Quý khách đã kết thúc trao đổi trực tiếp với Quản lý và quay lại trò chuyện cùng Trợ lý AI VietPeace Stay.",
+      row.currentHandoffId ? { handoffId: Number(row.currentHandoffId) } : {},
+    );
+
+    await enqueueOutbox(tx, {
+      kind: "SOCKET_EVENT",
+      conversationId: cid,
+      eventName: "message:created",
+      payload: {
+        conversationId: cid,
+        ownerKey: actor.actorKey,
+        targetManagerUserId,
+        message: sysMsg,
+        visibility: "PUBLIC",
+      },
+    });
+
+    await enqueueOutbox(tx, {
+      kind: "SOCKET_EVENT",
+      conversationId: cid,
+      eventName: "conversation:updated",
+      payload: {
+        conversationId: cid,
+        ownerKey: actor.actorKey,
+        targetManagerUserId,
+        handlingMode: "AI",
+        assignedUserId: null,
+        assignedManagerName: null,
+        currentHandoffId: null,
+        managerWaitExpiresAt: null,
+        ...(pendingRatingHandoffId
+          ? {
+              pendingRatingHandoffId,
+              pendingRatingManagerName,
+            }
+          : {}),
+      },
     });
   });
 
@@ -1428,7 +2181,7 @@ async function endGuestConversation(actor, conversationId) {
     await hardDeleteTemporaryConversation(tx, cid, {
       ownerKey: actor.actorKey,
       reason: "GUEST_ENDED",
-      notice: "Phiên trò chuyện tạm đã được kết thúc và dọn sạch theo yêu cầu của Quý khách.",
+      notice: null,
     });
   });
   return { erased: true, conversationId: cid };
@@ -1562,6 +2315,157 @@ async function syncOwnerDeliveredAll(actor) {
   return updated;
 }
 
+async function mergeGuestMessagesIntoCustomerTx(
+  tx,
+  { gCid, targetCid, gConv, customerActor, guestSessionId },
+) {
+  const targetRes = await newRequest(tx)
+    .input("cid", sqlObj.BigInt, targetCid)
+    .query(`
+      SELECT
+        id,
+        scope_type AS scopeType,
+        accommodation_id AS accommodationId,
+        booking_id AS bookingId,
+        handling_mode AS handlingMode,
+        last_sequence AS lastSequence,
+        last_message_preview AS lastMessagePreview,
+        context_json AS contextJson,
+        origin_guest_session_id AS originGuestSessionId
+      FROM dbo.chat_conversations
+      WHERE id = @cid;
+    `);
+  const targetCur = targetRes.recordset[0];
+  if (!targetCur) return;
+
+  const gMsgsRes = await newRequest(tx)
+    .input("gCid", sqlObj.BigInt, gCid)
+    .query(`
+      SELECT
+        sequence,
+        sender_actor_key AS senderActorKey,
+        sender_type AS senderType,
+        message_type AS messageType,
+        visibility,
+        content,
+        payload_json AS payloadJson,
+        client_message_id AS clientMessageId,
+        created_at AS createdAt
+      FROM dbo.chat_messages
+      WHERE conversation_id = @gCid
+        AND visibility IN ('PUBLIC', 'OWNER_ONLY')
+      ORDER BY sequence ASC;
+    `);
+
+  let nextSeq = Number(targetCur.lastSequence || 0);
+  let lastPreview = targetCur.lastMessagePreview || "";
+  let lastCreatedAt = null;
+  const hadExistingTargetMsgs = nextSeq > 0;
+
+  for (const m of gMsgsRes.recordset) {
+    if (
+      hadExistingTargetMsgs &&
+      Number(m.sequence) === 1 &&
+      m.senderType === "AI" &&
+      m.messageType === "TEXT" &&
+      m.content === POLITE_HOME_GREETING
+    ) {
+      continue;
+    }
+
+    const isGuestMsg = m.senderType === "GUEST";
+    const sKey = isGuestMsg ? customerActor.actorKey : m.senderActorKey;
+    const sType = isGuestMsg ? "CUSTOMER" : m.senderType;
+
+    if (m.clientMessageId) {
+      const dupMsg = await newRequest(tx)
+        .input("tCid", sqlObj.BigInt, targetCid)
+        .input("sKey", sqlObj.VarChar(100), sKey)
+        .input("cMsgId", sqlObj.VarChar(100), m.clientMessageId)
+        .query(`
+          SELECT TOP 1 id FROM dbo.chat_messages
+          WHERE conversation_id = @tCid AND sender_actor_key = @sKey AND client_message_id = @cMsgId;
+        `);
+      if (dupMsg.recordset[0]) continue;
+    }
+
+    nextSeq += 1;
+    lastPreview = previewText(m.content || "");
+    lastCreatedAt = m.createdAt;
+
+    await newRequest(tx)
+      .input("tCid", sqlObj.BigInt, targetCid)
+      .input("seq", sqlObj.BigInt, nextSeq)
+      .input("sKey", sqlObj.VarChar(100), sKey)
+      .input("sType", sqlObj.VarChar(20), sType)
+      .input("uid", sqlObj.UniqueIdentifier, isGuestMsg ? customerActor.userId : null)
+      .input("cMsgId", sqlObj.VarChar(100), m.clientMessageId || null)
+      .input("mType", sqlObj.VarChar(32), m.messageType)
+      .input("vis", sqlObj.VarChar(16), m.visibility)
+      .input("content", sqlObj.NVarChar(sqlObj.MAX), m.content)
+      .input("payloadJson", sqlObj.NVarChar(sqlObj.MAX), m.payloadJson || null)
+      .input("createdAt", sqlObj.DateTime2(3), m.createdAt)
+      .query(`
+        INSERT INTO dbo.chat_messages (
+          conversation_id, sequence, sender_actor_key, sender_type,
+          sender_user_id, sender_guest_session_id, client_message_id,
+          message_type, visibility, content, payload_json, created_at
+        )
+        VALUES (
+          @tCid, @seq, @sKey, @sType,
+          @uid, NULL, @cMsgId,
+          @mType, @vis, @content, @payloadJson, @createdAt
+        );
+      `);
+  }
+
+  let nextScopeType = targetCur.scopeType;
+  let nextAccomId = targetCur.accommodationId ? Number(targetCur.accommodationId) : null;
+  let nextBookingId = targetCur.bookingId ? Number(targetCur.bookingId) : null;
+  const targetCtx = parseJsonSafe(targetCur.contextJson, {}) || {};
+  const guestCtx = parseJsonSafe(gConv.contextJson, {}) || {};
+  let mergedCtx = targetCtx;
+
+  if (targetCur.handlingMode === "AI" && gConv.handlingMode === "AI") {
+    if (guestCtx.pageContext) {
+      mergedCtx = applyPageContextToConversationCtx(targetCtx, guestCtx.pageContext);
+      if (guestCtx.lastAttachedContextKey) {
+        mergedCtx.lastAttachedContextKey = guestCtx.lastAttachedContextKey;
+      }
+    }
+    if (gConv.scopeType === "PROPERTY" && gConv.accommodationId) {
+      nextScopeType = "PROPERTY";
+      nextAccomId = Number(gConv.accommodationId);
+      nextBookingId = gConv.bookingId ? Number(gConv.bookingId) : null;
+    }
+  }
+
+  await newRequest(tx)
+    .input("tCid", sqlObj.BigInt, targetCid)
+    .input("gid", sqlObj.UniqueIdentifier, guestSessionId)
+    .input("scope", sqlObj.VarChar(16), nextScopeType)
+    .input("accomId", sqlObj.Int, nextAccomId)
+    .input("bookingId", sqlObj.BigInt, nextBookingId)
+    .input("lastSeq", sqlObj.BigInt, nextSeq)
+    .input("preview", sqlObj.NVarChar(300), lastPreview)
+    .input("lastAt", sqlObj.DateTime2(3), lastCreatedAt)
+    .input("ctxJson", sqlObj.NVarChar(sqlObj.MAX), JSON.stringify(mergedCtx))
+    .query(`
+      UPDATE dbo.chat_conversations
+      SET origin_guest_session_id = COALESCE(origin_guest_session_id, @gid),
+          scope_type = @scope,
+          accommodation_id = @accomId,
+          booking_id = @bookingId,
+          last_sequence = @lastSeq,
+          last_message_preview = @preview,
+          last_message_at = COALESCE(@lastAt, last_message_at),
+          context_json = @ctxJson,
+          control_revision = control_revision + 1,
+          updated_at = SYSUTCDATETIME()
+      WHERE id = @tCid;
+    `);
+}
+
 async function claimGuestConversationsToCustomer(customerActor, guestSessionId) {
   if (!customerActor || customerActor.type !== "CUSTOMER" || !guestSessionId) {
     return { claimedCount: 0, mergedCount: 0 };
@@ -1574,10 +2478,23 @@ async function claimGuestConversationsToCustomer(customerActor, guestSessionId) 
     const guestConvsRes = await newRequest(tx)
       .input("gid", sqlObj.UniqueIdentifier, guestSessionId)
       .query(`
-        SELECT id, scope_type AS scopeType, accommodation_id AS accommodationId, booking_id AS bookingId
+        SELECT
+          id,
+          scope_type AS scopeType,
+          accommodation_id AS accommodationId,
+          booking_id AS bookingId,
+          handling_mode AS handlingMode,
+          context_json AS contextJson
         FROM dbo.chat_conversations WITH (UPDLOCK, HOLDLOCK)
         WHERE guest_session_id = @gid AND status = 'OPEN'
-        ORDER BY id ASC;
+        ORDER BY
+          CASE
+            WHEN handling_mode = 'HUMAN' THEN 0
+            WHEN handling_mode = 'WAITING_HUMAN' THEN 1
+            ELSE 2
+          END,
+          COALESCE(last_message_at, created_at) DESC,
+          id DESC;
       `);
 
     const guestConvs = guestConvsRes.recordset;
@@ -1593,36 +2510,63 @@ async function claimGuestConversationsToCustomer(customerActor, guestSessionId) 
       return { claimedCount: 0, mergedCount: 0 };
     }
 
-    const accomIds = guestConvs.map((c) => c.accommodationId).filter(Boolean);
+    const existingCustRes = await newRequest(tx)
+      .input("uid", sqlObj.UniqueIdentifier, customerActor.userId)
+      .query(`
+        SELECT TOP 1
+          id,
+          handling_mode AS handlingMode,
+          accommodation_id AS accommodationId
+        FROM dbo.chat_conversations WITH (UPDLOCK, HOLDLOCK)
+        WHERE customer_user_id = @uid AND status = 'OPEN'
+        ORDER BY
+          CASE
+            WHEN handling_mode = 'HUMAN' THEN 0
+            WHEN handling_mode = 'WAITING_HUMAN' THEN 1
+            ELSE 2
+          END,
+          COALESCE(last_message_at, created_at) DESC,
+          id DESC;
+      `);
+
+    const accomIds = [
+      ...guestConvs.map((c) => c.accommodationId),
+      existingCustRes.recordset[0]?.accommodationId,
+    ].filter(Boolean);
     if (accomIds.length > 0) await lockAccommodationsInOrder(tx, accomIds);
 
     let claimedCount = 0;
     let mergedCount = 0;
+    let targetCid = existingCustRes.recordset[0] ? Number(existingCustRes.recordset[0].id) : null;
+    let targetMode = existingCustRes.recordset[0]?.handlingMode || null;
 
     for (const gConv of guestConvs) {
       const gCid = Number(gConv.id);
-      const dupRes = await newRequest(tx)
-        .input("uid", sqlObj.UniqueIdentifier, customerActor.userId)
-        .input("scope", sqlObj.VarChar(16), gConv.scopeType)
-        .input("accomId", sqlObj.Int, gConv.accommodationId || null)
-        .input("bookingId", sqlObj.BigInt, gConv.bookingId || null)
-        .query(`
-          SELECT TOP 1 id
-          FROM dbo.chat_conversations WITH (UPDLOCK, HOLDLOCK)
-          WHERE customer_user_id = @uid
-            AND status = 'OPEN'
-            AND scope_type = @scope
-            AND ((accommodation_id IS NULL AND @accomId IS NULL) OR accommodation_id = @accomId)
-            AND ((booking_id IS NULL AND @bookingId IS NULL) OR booking_id = @bookingId);
-        `);
 
-      if (dupRes.recordset[0]) {
-        const targetCid = Number(dupRes.recordset[0].id);
+      // If Customer only has an idle AI shell and Guest was already WAITING_HUMAN / HUMAN, carry history and keep Guest's live handoff
+      if (targetCid && targetMode === "AI" && gConv.handlingMode !== "AI") {
+        await syncMessagesFromSourceConversationsTx(tx, {
+          targetCid: gCid,
+          sourceCids: [targetCid],
+          resolveSources: true,
+        });
+        targetCid = null;
+        targetMode = null;
+      }
+
+      if (targetCid) {
         await lockConversationsInOrder(tx, [Math.min(gCid, targetCid), Math.max(gCid, targetCid)]);
+        await mergeGuestMessagesIntoCustomerTx(tx, {
+          gCid,
+          targetCid,
+          gConv,
+          customerActor,
+          guestSessionId,
+        });
         await hardDeleteTemporaryConversation(tx, gCid, {
           ownerKey: actorKeyForGuest(guestSessionId),
           reason: "CLAIMED_MERGED",
-          notice: "Hội thoại tạm đã được đồng bộ vào tài khoản của Quý khách.",
+          notice: null,
         });
         mergedCount += 1;
       } else {
@@ -1657,6 +2601,8 @@ async function claimGuestConversationsToCustomer(customerActor, guestSessionId) 
               WHERE conversation_id = @cid AND guest_session_id = @gid;
             END;
           `);
+        targetCid = gCid;
+        targetMode = gConv.handlingMode;
         claimedCount += 1;
       }
     }
@@ -1670,7 +2616,7 @@ async function claimGuestConversationsToCustomer(customerActor, guestSessionId) 
         WHERE id = @gid AND claimed_by_user_id IS NULL;
       `);
 
-    return { claimedCount, mergedCount };
+    return { claimedCount, mergedCount, unifiedConversationId: targetCid };
   });
 }
 
@@ -1733,6 +2679,7 @@ module.exports = {
   POLITE_HOME_GREETING,
   getFeaturedDestinations,
   resolveVerifiedPageContext,
+  assertOwnerConversation,
   listOwnerConversations,
   getOwnerConversationDetail,
   getOwnerConversationMessages,
@@ -1741,6 +2688,7 @@ module.exports = {
   sendOwnerMessage,
   requestHumanSupport,
   cancelHumanSupport,
+  returnOwnerConversationToAi,
   endGuestConversation,
   transferScopeOrReopen,
   updateOwnerReceipt,

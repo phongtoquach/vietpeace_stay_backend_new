@@ -257,7 +257,7 @@ async function syncManagerEpochInTransaction(
  * Physical immediate cleanup of Guest TEMPORARY conversation in strict FK order.
  * Enqueues conversation:expired with conversation_id = NULL BEFORE deleting child rows.
  */
-async function hardDeleteTemporaryConversation(tx, conversationId, { ownerKey, reason, notice }) {
+async function hardDeleteTemporaryConversation(tx, conversationId, { ownerKey, reason, notice = null }) {
   const cid = Number(conversationId);
 
   // Emit expiration socket event with conversation_id = NULL so it is NOT deleted below and still reaches the guest socket!
@@ -300,7 +300,16 @@ async function hardDeleteTemporaryConversation(tx, conversationId, { ownerKey, r
  * 2) TEMPORARY AI idle guest_ai_close_at <= now (3 min timeout -> immediate delete)
  * 3) TEMPORARY abandoned/cancelled temporary_cleanup_at <= now (5 min safety -> immediate delete)
  */
-async function processExpiryBatch() {
+let activeExpiryBatch = null;
+
+function processExpiryBatch() {
+  if (!activeExpiryBatch) {
+    activeExpiryBatch = runExpiryBatch().finally(() => { activeExpiryBatch = null; });
+  }
+  return activeExpiryBatch;
+}
+
+async function runExpiryBatch() {
   const pool = getDBPool();
 
   // 1) 5-minute manager wait timeout (both Guest TEMPORARY and Customer PERSISTENT)
@@ -459,11 +468,10 @@ async function processExpiryBatch() {
         ].filter(Boolean);
 
         if (conv.retentionState === "TEMPORARY" && !conv.customerUserId) {
-          const notice = `Rất tiếc, đã quá 5 phút nhưng Quản lý ${conv.accommodationName || "cơ sở"} chưa kịp tiếp nhận yêu cầu. Phiên chat tạm đã tự động kết thúc. Quý khách có thể liên hệ trực tiếp${contactLines.length ? `:\n${contactLines.join("\n")}` : " qua SĐT của cơ sở"} hoặc mở chat mới với Trợ lý AI.`;
           await hardDeleteTemporaryConversation(tx, cid, {
             ownerKey,
             reason: "MANAGER_WAIT_TIMEOUT",
-            notice,
+            notice: null,
           });
         } else {
           await newRequest(tx)
@@ -479,7 +487,7 @@ async function processExpiryBatch() {
               WHERE id = @cid;
             `);
 
-          const msgText = `Hiện đã quá 5 phút chờ nhưng Quản lý ${conv.accommodationName || "cơ sở"} chưa kịp tiếp nhận. Yêu cầu kết nối đã tự động hủy và được ghi nhận báo cáo tới Ban quản trị.\n\nTrợ lý AI VietPeace Stay vẫn tiếp tục hỗ trợ bạn tại đây, hoặc bạn có thể liên hệ trực tiếp cơ sở${contactLines.length ? `:\n${contactLines.join("\n")}` : "."}`;
+          const msgText = `Hiện đã quá 5 phút chờ nhưng Quản lý ${conv.accommodationName || "cơ sở"} chưa kịp tiếp nhận. Yêu cầu kết nối đã hết thời gian chờ.\n\nTrợ lý AI VietPeace Stay vẫn tiếp tục hỗ trợ bạn tại đây, hoặc bạn có thể liên hệ trực tiếp cơ sở${contactLines.length ? `:\n${contactLines.join("\n")}` : "."}`;
           const sysMsg = await appendSystemMessage(tx, cid, msgText, {
             handoffId: conv.currentHandoffId,
           });
@@ -553,11 +561,8 @@ async function processExpiryBatch() {
 
         const ownerKey = actorKeyForGuest(conv.guestSessionId);
         const reason = aiDue ? "GUEST_AI_TIMEOUT" : "GUEST_TEMP_EXPIRED";
-        const notice = aiDue
-          ? "Phiên tư vấn AI tạm thời đã tự động kết thúc sau 3 phút không có tin nhắn mới."
-          : "Phiên trò chuyện tạm đã tự động kết thúc và được dọn sạch.";
 
-        await hardDeleteTemporaryConversation(tx, cid, { ownerKey, reason, notice });
+        await hardDeleteTemporaryConversation(tx, cid, { ownerKey, reason, notice: null });
       });
     } catch (err) {
       console.error("[chat.lifecycle.guestTempExpiry]", cid, err);

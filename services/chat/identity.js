@@ -218,6 +218,17 @@ function decodeSignedSessionCookie(rawCookieVal) {
   return dotIdx > 0 ? val.slice(0, dotIdx) : val;
 }
 
+async function hasLiveSourceSession(actor, audience, sourceSessionKey) {
+  if (!actor?.userId || !["web", "admin"].includes(audience)) return false;
+  const prefix = `${audience}:`;
+  if (typeof sourceSessionKey !== "string" || !sourceSessionKey.startsWith(prefix)) return false;
+  const sid = sourceSessionKey.slice(prefix.length);
+  if (!sid) return false;
+  const session = await readSessionById(sid, audience);
+  const sessionUserId = audience === "admin" ? session?.admin?.id : session?.customer?.id;
+  return Boolean(sessionUserId) && String(sessionUserId).toLowerCase() === String(actor.userId).toLowerCase();
+}
+
 async function consumeSocketTicket(rawToken, handshakeReq) {
   if (!rawToken || typeof rawToken !== "string") {
     throw chatError(401, "INVALID_TICKET", "Thiếu vé xác thực Socket.");
@@ -254,6 +265,9 @@ async function consumeSocketTicket(rawToken, handshakeReq) {
   const cookies = parseCookies(handshakeReq);
 
   if (ticketRow.audience === "admin") {
+    if (!(await hasLiveSourceSession({ userId: ticketRow.userId }, "admin", ticketRow.sourceSessionKey))) {
+      throw chatError(401, "SESSION_EXPIRED", "Phiên quản trị không còn hiệu lực.");
+    }
     const sid = decodeSignedSessionCookie(cookies["vietpeace.admin.sid"]);
     if (sid) {
       const sess = await readSessionById(sid, "admin");
@@ -268,6 +282,9 @@ async function consumeSocketTicket(rawToken, handshakeReq) {
 
   // audience === 'web'
   if (ticketRow.userId) {
+    if (!(await hasLiveSourceSession({ userId: ticketRow.userId }, "web", ticketRow.sourceSessionKey))) {
+      throw chatError(401, "SESSION_EXPIRED", "Phiên khách hàng không còn hiệu lực.");
+    }
     const sid = decodeSignedSessionCookie(cookies["vietpeace.customer.sid"]);
     if (sid) {
       const sess = await readSessionById(sid, "web");
@@ -336,9 +353,11 @@ async function revalidateSocketActor(socketData) {
   }
 
   if (actor.type === "CUSTOMER") {
+    if (!(await hasLiveSourceSession(actor, "web", socketData.sourceSessionKey))) return null;
     return loadCustomerById(actor.userId);
   }
 
+  if (!(await hasLiveSourceSession(actor, "admin", socketData.sourceSessionKey))) return null;
   const cached = getCachedActor(actor.userId);
   if (cached) return cached;
   try {

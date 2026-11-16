@@ -12,6 +12,7 @@ const requireAdminLogin = require("../../middlewares/requireAdminLogin");
  * Các API public (không yêu cầu admin login)
  */
 router.post("/login", authController.login);
+router.post("/forgot-password", authController.forgotPassword);
 router.post("/reset-password", authController.resetPassword);
 
 /**
@@ -19,6 +20,8 @@ router.post("/reset-password", authController.resetPassword);
  */
 router.get("/loggedin-user", requireAdminLogin, authController.getLoggedInAdminUser);
 router.post("/change-initial-password", requireAdminLogin, authController.changeInitialPassword);
+router.post("/change-password", requireAdminLogin, authController.changePassword);
+router.put("/profile", requireAdminLogin, authController.updateProfile);
 router.post("/logout", requireAdminLogin, authController.logout);
 
 module.exports = router;

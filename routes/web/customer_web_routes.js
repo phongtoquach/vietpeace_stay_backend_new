@@ -7,6 +7,7 @@ const router = express.Router();
 
 const customerController = require("../../controllers/web/customer/customerController");
 const customerBookingsController = require("../../controllers/web/customer/customerBookingsController");
+const customerSettlementController = require("../../controllers/web/customer/customerSettlementController");
 
 //const requireCustomerLogin = require("../middlewares/requireCustomerLogin");
 
@@ -25,6 +26,7 @@ router.post("/bookings", customerBookingsController.getCustomerBookings);
 router.get("/bookings/booking/:bookingId", customerBookingsController.getBookingDetail);
 router.get("/bookings", customerBookingsController.listCustomerBookingsHandler);
 router.get("/bookings/:bookingId", customerBookingsController.getCustomerBookingDetail);
+router.post("/bookings/:bookingId/settlement/vnpay-create", customerSettlementController.createCustomerSettlementVnpay);
 
 
 // export

@@ -1,8 +1,12 @@
 const express = require("express");
 const router = express.Router();
 
-// Import controller
+// Import controller & middleware
 const locationController = require("../../controllers/admin/location/locationController");
+const requireAdminLogin = require("../../middlewares/requireAdminLogin");
+const requireRole = require("../../middlewares/requireRole");
+
+router.use(requireAdminLogin, requireRole("ADMIN"));
 
 // 1. API lấy danh sách tất cả điểm đến: GET /api/admin/locations
 router.get("/", locationController.getLocationsList);

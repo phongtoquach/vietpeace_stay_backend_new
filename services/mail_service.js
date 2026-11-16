@@ -468,21 +468,26 @@ async function sendChatCskhWarningEmail({
     rating,
     customerComment,
     adminNote,
+    customSubject,
+    customBody,
 }) {
     const adminUrl = process.env.ADMIN_PANEL_DOMAIN || "http://localhost:5175";
-    const subject = `[VietPeace Stay CSKH] Nhắc nhở chất lượng tư vấn (${rating}/5 sao) — ${accommodationName}`;
+    const subject =
+        (customSubject && String(customSubject).trim()) ||
+        `[VietPeace Stay CSKH] Cảnh cáo chất lượng tư vấn (${rating}/5 sao) — ${accommodationName}`;
     const safeName = escapeMailHtml(managerName || "Quản lý cơ sở");
     const safeAccom = escapeMailHtml(accommodationName || "Cơ sở lưu trú");
     const safeComment = escapeMailHtml(customerComment || "(Khách không để lại nhận xét thêm)");
     const safeNote = escapeMailHtml(adminNote || "Vui lòng rà soát tốc độ phản hồi và thái độ phục vụ khách trên hệ thống Chat.");
+    const safeCustomBody = customBody ? escapeMailHtml(customBody).replace(/\r?\n/g, "<br />") : null;
 
-    const htmlContent = `
-        <div style="font-family: Arial, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #292D32; max-width: 620px; margin: 0 auto; border: 1px solid #E5E7EB; border-radius: 10px; overflow: hidden; background-color: #ffffff;">
-            <div style="background: linear-gradient(135deg, #233B53 0%, #172A3C 100%); color: #ffffff; padding: 24px; text-align: center; border-bottom: 3px solid #F5B82E;">
-                <h1 style="margin: 0; font-size: 20px; font-weight: 800;">VIETPEACE STAY CSKH</h1>
-                <p style="margin: 6px 0 0; font-size: 13px; color: #FFF1C2;">THÔNG BÁO RÀ SOÁT CHẤT LƯỢNG TƯ VẤN KHÁCH HÀNG</p>
-            </div>
-            <div style="padding: 24px;">
+    const bodySectionHtml = safeCustomBody
+        ? `
+                <div style="background-color: #FEF2F2; border-left: 4px solid #C0392B; padding: 14px 16px; border-radius: 6px; margin: 14px 0; color: #1F2937;">
+                    ${safeCustomBody}
+                </div>
+            `
+        : `
                 <p style="margin-top: 0;">Xin chào <strong>${safeName}</strong>,</p>
                 <p>Hệ thống vừa ghi nhận một đánh giá <strong>${Number(rating)}/5 sao</strong> đối với phiên tư vấn trực tuyến tại cơ sở <strong>${safeAccom}</strong> đã được Quản trị viên xác nhận cần rút kinh nghiệm:</p>
                 <div style="background-color: #FFF9ED; border-left: 4px solid #F5B82E; padding: 12px 14px; border-radius: 6px; margin: 16px 0;">
@@ -493,6 +498,16 @@ async function sendChatCskhWarningEmail({
                     <div style="font-size: 12px; font-weight: 700; color: #991B1B; margin-bottom: 4px;">CHỈ ĐẠO TỪ QUẢN TRỊ VIÊN</div>
                     <div style="color: #1F2937;">${safeNote}</div>
                 </div>
+            `;
+
+    const htmlContent = `
+        <div style="font-family: Arial, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #292D32; max-width: 620px; margin: 0 auto; border: 1px solid #E5E7EB; border-radius: 10px; overflow: hidden; background-color: #ffffff;">
+            <div style="background: linear-gradient(135deg, #233B53 0%, #172A3C 100%); color: #ffffff; padding: 24px; text-align: center; border-bottom: 3px solid #F5B82E;">
+                <h1 style="margin: 0; font-size: 20px; font-weight: 800;">VIETPEACE STAY CSKH</h1>
+                <p style="margin: 6px 0 0; font-size: 13px; color: #FFF1C2;">THƯ CẢNH CÁO &amp; NHẮC NHỞ CHẤT LƯỢNG TƯ VẤN KHÁCH HÀNG</p>
+            </div>
+            <div style="padding: 24px;">
+                ${bodySectionHtml}
                 <div style="text-align: center; margin-top: 22px;">
                     <a href="${adminUrl}/chat" style="background-color: #F4C542; color: #24220A; text-decoration: none; font-weight: 700; font-size: 14px; padding: 10px 24px; border-radius: 6px; display: inline-block;">
                         Mở Trung tâm CSKH VietPeace Stay &rarr;
@@ -504,76 +519,156 @@ async function sendChatCskhWarningEmail({
 
     const transporter = getTransporter();
     if (transporter) {
-        await transporter.sendMail({
+        const delivery = await transporter.sendMail({
             from: process.env.MAIL_FROM || `"VietPeace Stay CSKH" <${process.env.SMTP_USER}>`,
             to: toGmail,
             subject,
+            text: customBody ? String(customBody) : undefined,
             html: htmlContent,
         });
+        const recipient = String(toGmail || "").trim().toLowerCase();
+        const accepted = delivery?.accepted?.some(address => String(address?.address || address).trim().toLowerCase() === recipient);
+        if (!accepted) return { success: false, method: "smtp_rejected", error: "SMTP không chấp nhận người nhận email cảnh báo." };
         return { success: true, method: "smtp" };
     }
 
-    console.log(`\n📨 [DEV LOG] CHAT CSKH WARNING EMAIL -> ${toGmail} (${safeAccom}, ${rating} sao)\n`);
-    return { success: true, method: "dev_log" };
+    return { success: false, method: "smtp_not_configured", error: "Chưa cấu hình SMTP gửi email cảnh báo." };
+}
+
+async function sendTransactionalHtmlMail({
+    toEmail,
+    subject,
+    textContent,
+    htmlContent,
+    logContext = "email",
+}) {
+    const transporter = getTransporter();
+
+    if (!transporter) {
+        console.warn(`[MailService] Chưa cấu hình SMTP nên không thể gửi ${logContext} đến ${toEmail}`);
+        return { success: false, method: "smtp_not_configured" };
+    }
+
+    try {
+        const info = await transporter.sendMail({
+            from: process.env.MAIL_FROM?.trim() || `"VietPeace Stay" <${process.env.SMTP_USER}>`,
+            to: toEmail,
+            subject,
+            text: textContent,
+            html: htmlContent,
+        });
+        if (!info.accepted?.some((address) => String(address).toLowerCase() === String(toEmail).toLowerCase())) {
+            return { success: false, method: "smtp_rejected" };
+        }
+        return { success: true, method: "smtp" };
+    } catch (error) {
+        console.error(`[MailService] Gửi ${logContext} thất bại:`, error.code || error.message || "SMTP_ERROR");
+        return { success: false, method: "smtp_error", error: error.message || "SMTP_SEND_ERROR" };
+    }
+}
+
+function getWebLoginBaseUrl() {
+    return (process.env.WEB_DOMAIN || "http://localhost:5178")
+        .trim()
+        .replace(/^["']|["']$/g, "");
 }
 
 /**
- * Gửi email xác thực tài khoản khách hàng sau khi đăng ký
+ * Gửi email mã xác nhận kích hoạt cho lần đăng nhập đầu tiên của khách hàng
  */
 async function sendCustomerVerificationEmail({
     toEmail,
     fullName,
+    verificationCode,
     verificationUrl,
     expiresInHours = 24,
 }) {
     const safeName = escapeMailHtml(fullName || "Quý khách");
     const safeEmail = escapeMailHtml(toEmail || "");
-    const safeUrl = escapeMailHtml(verificationUrl || "");
+    const safeCode = escapeMailHtml(verificationCode || "");
     const hours = Number(expiresInHours) || 24;
-    const subject = "[VietPeace Stay] Xác thực địa chỉ email tài khoản của bạn";
+    const loginUrlObj = new URL("/login", getWebLoginBaseUrl());
+    if (toEmail) loginUrlObj.searchParams.set("email", toEmail);
+    if (verificationCode) loginUrlObj.searchParams.set("verify", "1");
+    const safeLoginUrl = escapeMailHtml(verificationUrl || loginUrlObj.toString());
 
-    const textContent = [
-        `Xin chào ${fullName || "Quý khách"},`,
-        "",
-        "Cảm ơn bạn đã đăng ký tài khoản tại VietPeace Stay.",
-        `Vui lòng truy cập liên kết sau để xác thực email và kích hoạt tài khoản (có hiệu lực trong ${hours} giờ):`,
-        verificationUrl,
-        "",
-        "Nếu bạn không thực hiện đăng ký tài khoản này, vui lòng bỏ qua email này.",
-    ].join("\n");
+    const subject = verificationCode
+        ? "[VietPeace Stay] Mã xác nhận kích hoạt tài khoản đăng nhập lần đầu"
+        : "[VietPeace Stay] Xác thực địa chỉ email tài khoản của bạn";
 
-    const htmlContent = `
-        <div style="font-family: Arial, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #292D32; max-width: 620px; margin: 0 auto; border: 1px solid #E5E7EB; border-radius: 10px; overflow: hidden; background-color: #ffffff; box-shadow: 0 4px 12px rgba(0,0,0,0.06);">
-            <div style="background: linear-gradient(135deg, #173B2B 0%, #233B53 100%); color: #ffffff; padding: 28px 24px; text-align: center; border-bottom: 3px solid #F5B82E;">
-                <h1 style="margin: 0; font-size: 22px; font-weight: 800; letter-spacing: 0.5px; text-transform: uppercase;">VIETPEACE STAY</h1>
-                <p style="margin: 6px 0 0; font-size: 13.5px; color: #FEF3C7; opacity: 0.95; font-weight: 500;">XÁC THỰC ĐỊA CHỈ EMAIL TÀI KHOẢN KHÁCH HÀNG</p>
-            </div>
+    const textContent = verificationCode
+        ? [
+            `Xin chào ${fullName || "Quý khách"},`,
+            "",
+            "Tài khoản khách hàng tại VietPeace Stay của bạn đã được tạo thành công.",
+            `Tên đăng nhập: ${toEmail}`,
+            `Mã xác nhận đăng nhập lần đầu: ${verificationCode}`,
+            "",
+            `Khi đăng nhập lần đầu tiên, vui lòng nhập mã xác nhận trên để kích hoạt tài khoản (có hiệu lực trong ${hours} giờ).`,
+            "Từ những lần đăng nhập sau, bạn sẽ không cần nhập lại mã này.",
+            `Đăng nhập tại: ${loginUrlObj.toString()}`,
+        ].join("\n")
+        : [
+            `Xin chào ${fullName || "Quý khách"},`,
+            "",
+            "Cảm ơn bạn đã đăng ký tài khoản tại VietPeace Stay.",
+            `Vui lòng truy cập liên kết sau để xác thực email và kích hoạt tài khoản (có hiệu lực trong ${hours} giờ):`,
+            verificationUrl,
+            "",
+            "Nếu bạn không thực hiện đăng ký tài khoản này, vui lòng bỏ qua email này.",
+        ].join("\n");
 
-            <div style="padding: 28px 24px;">
-                <p style="margin-top: 0; font-size: 15px;">Xin chào <strong>${safeName}</strong>,</p>
-                <p style="font-size: 14.5px; color: #374151;">
-                    Cảm ơn bạn đã đăng ký tài khoản thành viên tại <strong>VietPeace Stay</strong> với email <strong>${safeEmail}</strong>.
-                    Để hoàn tất đăng ký và bắt đầu đặt phòng, vui lòng xác thực địa chỉ email của bạn bằng nút bên dưới.
-                </p>
-
+    const verificationBoxHtml = verificationCode
+        ? `
+                <div style="background-color: #FFFDF7; border: 1.5px dashed #D97706; border-radius: 10px; padding: 22px 20px; margin: 24px 0; text-align: center;">
+                    <div style="font-size: 12px; font-weight: 700; color: #92400E; text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 10px;">
+                        Mã xác nhận kích hoạt tài khoản
+                    </div>
+                    <div style="display: inline-block; background-color: #FFFFFF; border: 1px solid #FCD34D; border-radius: 8px; padding: 12px 24px; font-family: Consolas, 'Courier New', monospace; font-size: 28px; font-weight: 800; letter-spacing: 6px; color: #0F172A; user-select: all; -webkit-user-select: all;">
+                        ${safeCode}
+                    </div>
+                    <p style="margin: 14px 0 0; font-size: 13px; color: #4B5563;">
+                        Tên đăng nhập của bạn là email <strong>${safeEmail}</strong>.<br/>
+                        Mã chỉ sử dụng ở <strong>lần đăng nhập đầu tiên</strong> và có hiệu lực trong vòng <strong>${hours} giờ</strong>.
+                    </p>
+                    <div style="margin-top: 16px;">
+                        <a href="${safeLoginUrl}" style="background-color: #F5B82E; color: #0F172A; text-decoration: none; font-weight: 800; font-size: 14.5px; padding: 11px 24px; border-radius: 8px; display: inline-block; border: 1px solid #D99B16;">
+                            Đi tới trang Đăng nhập &rarr;
+                        </a>
+                    </div>
+                </div>
+        `
+        : `
                 <div style="background-color: #FFFDF7; border: 1px solid #FDE68A; border-radius: 8px; padding: 22px 20px; margin: 24px 0; text-align: center;">
-                    <a href="${safeUrl}" style="background-color: #F5B82E; color: #173B2B; text-decoration: none; font-weight: 800; font-size: 15px; padding: 13px 28px; border-radius: 8px; display: inline-block; border: 1px solid #D99B16;">
+                    <a href="${safeLoginUrl}" style="background-color: #F5B82E; color: #173B2B; text-decoration: none; font-weight: 800; font-size: 15px; padding: 13px 28px; border-radius: 8px; display: inline-block; border: 1px solid #D99B16;">
                         Xác thực Email ngay &rarr;
                     </a>
                     <p style="margin: 14px 0 0; font-size: 12.5px; color: #6B7280;">
                         Liên kết xác thực có hiệu lực trong vòng <strong>${hours} giờ</strong> và chỉ sử dụng một lần.
                     </p>
                 </div>
+        `;
 
-                <p style="font-size: 13px; color: #4B5563; margin-bottom: 8px;">
-                    Nếu nút bấm không hoạt động, bạn có thể sao chép và dán đường dẫn sau vào trình duyệt:
+    const htmlContent = `
+        <div style="font-family: Arial, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #292D32; max-width: 620px; margin: 0 auto; border: 1px solid #E5E7EB; border-radius: 10px; overflow: hidden; background-color: #ffffff; box-shadow: 0 4px 12px rgba(0,0,0,0.06);">
+            <div style="background: linear-gradient(135deg, #173B2B 0%, #233B53 100%); color: #ffffff; padding: 28px 24px; text-align: center; border-bottom: 3px solid #F5B82E;">
+                <h1 style="margin: 0; font-size: 22px; font-weight: 800; letter-spacing: 0.5px; text-transform: uppercase;">VIETPEACE STAY</h1>
+                <p style="margin: 6px 0 0; font-size: 13.5px; color: #FEF3C7; opacity: 0.95; font-weight: 500;">XÁC NHẬN KÍCH HOẠT TÀI KHOẢN KHÁCH HÀNG</p>
+            </div>
+
+            <div style="padding: 28px 24px;">
+                <p style="margin-top: 0; font-size: 15px;">Xin chào <strong>${safeName}</strong>,</p>
+                <p style="font-size: 14.5px; color: #374151;">
+                    Cảm ơn bạn đã đăng ký tài khoản thành viên tại <strong>VietPeace Stay</strong> với email <strong>${safeEmail}</strong>.
+                    ${verificationCode
+                        ? "Để bảo mật và kích hoạt tài khoản trong lần đăng nhập đầu tiên, vui lòng nhập mã xác nhận dưới đây ngay tại màn hình đăng nhập. Những lần đăng nhập sau sẽ không cần nhập mã này nữa."
+                        : "Để hoàn tất đăng ký và bắt đầu đặt phòng, vui lòng xác thực địa chỉ email của bạn."}
                 </p>
-                <p style="font-size: 12.5px; color: #0284C7; word-break: break-all; background-color: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 6px; padding: 10px 12px; margin-top: 0;">
-                    <a href="${safeUrl}" style="color: #0284C7; text-decoration: underline;">${safeUrl}</a>
-                </p>
+
+                ${verificationBoxHtml}
 
                 <p style="font-size: 13px; color: #64748B; margin-bottom: 0; margin-top: 20px;">
-                    Nếu bạn không yêu cầu tạo tài khoản tại VietPeace Stay, vui lòng bỏ qua email này. Tài khoản sẽ không được kích hoạt nếu chưa xác thực.
+                    Nếu bạn không thực hiện đăng ký tài khoản tại VietPeace Stay, vui lòng bỏ qua email này. Tài khoản sẽ không thể đăng nhập nếu chưa xác nhận mã kích hoạt.
                 </p>
             </div>
 
@@ -583,36 +678,215 @@ async function sendCustomerVerificationEmail({
         </div>
     `;
 
-    const transporter = getTransporter();
+    return sendTransactionalHtmlMail({
+        toEmail,
+        subject,
+        textContent,
+        htmlContent,
+        logContext: "email xác nhận khách hàng",
+    });
+}
 
-    if (transporter) {
-        try {
-            const info = await transporter.sendMail({
-                from: process.env.MAIL_FROM?.trim() || `"VietPeace Stay" <${process.env.SMTP_USER}>`,
-                to: toEmail,
-                subject,
-                text: textContent,
-                html: htmlContent,
-            });
-            if (!info.accepted?.some((address) => String(address).toLowerCase() === String(toEmail).toLowerCase())) {
-                return { success: false, method: "smtp_rejected" };
-            }
-            return { success: true, method: "smtp" };
-        } catch (error) {
-            console.error("[MailService] Gửi email xác thực khách hàng thất bại:", error.code || error.message || "SMTP_ERROR");
-            return { success: false, method: "smtp_error", error: error.message || "SMTP_SEND_ERROR" };
-        }
+/**
+ * Gửi email cấp mật khẩu mới khi khách hàng chọn Quên mật khẩu
+ */
+async function sendCustomerNewPasswordEmail({
+    toEmail,
+    fullName,
+    newPassword,
+}) {
+    const safeName = escapeMailHtml(fullName || "Quý khách");
+    const safeEmail = escapeMailHtml(toEmail || "");
+    const safePassword = escapeMailHtml(newPassword || "");
+    const loginUrlObj = new URL("/login", getWebLoginBaseUrl());
+    if (toEmail) loginUrlObj.searchParams.set("email", toEmail);
+    const safeLoginUrl = escapeMailHtml(loginUrlObj.toString());
+
+    const subject = "[VietPeace Stay] Mật khẩu đăng nhập mới cho tài khoản của bạn";
+
+    const textContent = [
+        `Xin chào ${fullName || "Quý khách"},`,
+        "",
+        "Chúng tôi đã tiếp nhận yêu cầu cấp lại mật khẩu từ tính năng Quên mật khẩu trên VietPeace Stay.",
+        `Tên đăng nhập (Email): ${toEmail}`,
+        `Mật khẩu mới của bạn: ${newPassword}`,
+        "",
+        `Đăng nhập ngay tại: ${loginUrlObj.toString()}`,
+        "Vì lý do bảo mật, bạn nên đổi lại mật khẩu cá nhân sau khi đăng nhập thành công.",
+    ].join("\n");
+
+    const htmlContent = `
+        <div style="font-family: Arial, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #292D32; max-width: 620px; margin: 0 auto; border: 1px solid #E5E7EB; border-radius: 10px; overflow: hidden; background-color: #ffffff; box-shadow: 0 4px 12px rgba(0,0,0,0.06);">
+            <div style="background: linear-gradient(135deg, #173B2B 0%, #233B53 100%); color: #ffffff; padding: 28px 24px; text-align: center; border-bottom: 3px solid #F5B82E;">
+                <h1 style="margin: 0; font-size: 22px; font-weight: 800; letter-spacing: 0.5px; text-transform: uppercase;">VIETPEACE STAY</h1>
+                <p style="margin: 6px 0 0; font-size: 13.5px; color: #FEF3C7; opacity: 0.95; font-weight: 500;">CẤP MẬT KHẨU ĐĂNG NHẬP MỚI</p>
+            </div>
+
+            <div style="padding: 28px 24px;">
+                <p style="margin-top: 0; font-size: 15px;">Xin chào <strong>${safeName}</strong>,</p>
+                <p style="font-size: 14.5px; color: #374151;">
+                    Hệ thống VietPeace Stay đã tạo mật khẩu mới theo yêu cầu <strong>Quên mật khẩu</strong> cho tài khoản của bạn.
+                </p>
+
+                <div style="background-color: #FFFDF7; border: 1.5px dashed #D97706; border-radius: 10px; padding: 20px; margin: 22px 0;">
+                    <div style="margin-bottom: 12px; background-color: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 6px; padding: 10px 14px;">
+                        <div style="font-size: 11px; font-weight: 700; color: #64748B; text-transform: uppercase; letter-spacing: 0.5px;">Tên đăng nhập (Email)</div>
+                        <div style="font-family: Consolas, 'Courier New', monospace; font-size: 15px; font-weight: 700; color: #0F172A; margin-top: 2px; word-break: break-all;">${safeEmail}</div>
+                    </div>
+
+                    <div style="margin-bottom: 18px; background-color: #FFFBEB; border: 1px solid #FCD34D; border-radius: 6px; padding: 12px 14px;">
+                        <div style="font-size: 11px; font-weight: 700; color: #92400E; text-transform: uppercase; letter-spacing: 0.5px;">Mật khẩu mới</div>
+                        <div style="font-family: Consolas, 'Courier New', monospace; font-size: 20px; font-weight: 800; color: #0F172A; letter-spacing: 1px; margin-top: 4px; user-select: all; -webkit-user-select: all;">${safePassword}</div>
+                    </div>
+
+                    <div style="text-align: center;">
+                        <a href="${safeLoginUrl}" style="background-color: #F5B82E; color: #0F172A; text-decoration: none; font-weight: 800; font-size: 14.5px; padding: 11px 24px; border-radius: 8px; display: inline-block; border: 1px solid #D99B16;">
+                            Đăng nhập ngay &rarr;
+                        </a>
+                    </div>
+                </div>
+
+                <div style="background-color: #F8FAFC; border-left: 4px solid #F5B82E; padding: 12px 14px; border-radius: 0 6px 6px 0; font-size: 13px; color: #475569;">
+                    <strong>Lưu ý bảo mật:</strong> Vui lòng sử dụng mật khẩu mới này để đăng nhập và bạn có thể đổi lại mật khẩu theo ý muốn trong mục Hồ sơ tài khoản.
+                </div>
+            </div>
+
+            <div style="background-color: #F8FAFC; border-top: 1px solid #E2E8F0; padding: 16px 20px; text-align: center; font-size: 12px; color: #64748B;">
+                © VietPeace Stay Hospitality. Email tự động, vui lòng không trả lời thư này.
+            </div>
+        </div>
+    `;
+
+    return sendTransactionalHtmlMail({
+        toEmail,
+        subject,
+        textContent,
+        htmlContent,
+        logContext: "email cấp mật khẩu mới",
+    });
+}
+
+/**
+ * Gửi email khôi phục thông tin đăng nhập nội bộ + mật khẩu tạm thời mới tới Gmail cá nhân của Admin/Manager
+ */
+async function sendAdminPortalForgotPasswordEmail({
+    toPersonalEmail,
+    fullName,
+    role,
+    accommodationName,
+    internalEmail,
+    newPassword,
+}) {
+    const adminBase = (process.env.ADMIN_PANEL_DOMAIN || "http://localhost:5175")
+        .trim()
+        .replace(/^["']|["']$/g, "")
+        .replace(/\/+$/, "");
+    const loginUrlObj = new URL("/login", adminBase);
+    if (internalEmail) {
+        loginUrlObj.searchParams.set("email", internalEmail);
     }
+    const loginUrl = loginUrlObj.toString();
 
-    console.warn(`[MailService] Chưa cấu hình SMTP nên không thể gửi email xác thực đến ${toEmail}`);
-    return { success: false, method: "smtp_not_configured" };
+    const safeName = escapeMailHtml(fullName || "Quản trị viên");
+    const safeInternalEmail = escapeMailHtml(internalEmail || "");
+    const safePassword = escapeMailHtml(newPassword || "");
+    const safeAccom = accommodationName ? escapeMailHtml(accommodationName) : "";
+    const roleLabel = role === "ADMIN"
+        ? "Quản trị viên cấp cao (ADMIN)"
+        : safeAccom
+            ? `Quản lý cơ sở — ${safeAccom}`
+            : "Quản lý cơ sở (ACCOMMODATION_MANAGER)";
+
+    const subject = "[VietPeace Stay] Khôi phục tài khoản & mật khẩu mới cổng Quản trị";
+
+    const textContent = [
+        `Xin chào ${fullName || "Quản trị viên"},`,
+        "",
+        "Chúng tôi đã tiếp nhận yêu cầu khôi phục thông tin đăng nhập Cổng quản trị VietPeace Stay qua email cá nhân của bạn.",
+        `Vai trò: ${role === "ADMIN" ? "Quản trị viên cấp cao (ADMIN)" : `Quản lý cơ sở${accommodationName ? ` — ${accommodationName}` : ""}`}`,
+        `Email đăng nhập nội bộ: ${internalEmail}`,
+        `Mật khẩu tạm thời mới: ${newPassword}`,
+        "",
+        `Đăng nhập tại: ${loginUrl}`,
+        "Lưu ý bảo mật: Ngay sau khi đăng nhập bằng mật khẩu tạm thời mới, hệ thống sẽ yêu cầu bạn đổi lại mật khẩu cá nhân.",
+    ].join("\n");
+
+    const htmlContent = `
+        <div style="font-family: Arial, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #292D32; max-width: 620px; margin: 0 auto; border: 1px solid #E5E7EB; border-radius: 10px; overflow: hidden; background-color: #ffffff; box-shadow: 0 4px 12px rgba(0,0,0,0.06);">
+            <div style="background: linear-gradient(135deg, #78350F 0%, #B45309 45%, #D97706 100%); color: #ffffff; padding: 28px 24px; text-align: center;">
+                <h1 style="margin: 0; font-size: 22px; font-weight: 800; letter-spacing: 0.5px; text-transform: uppercase;">VIETPEACE STAY HOSPITALITY</h1>
+                <p style="margin: 6px 0 0; font-size: 13.5px; color: #FEF3C7; opacity: 0.95; font-weight: 500;">KHÔI PHỤC TÀI KHOẢN NỘI BỘ &amp; MẬT KHẨU MỚI</p>
+            </div>
+
+            <div style="padding: 28px 24px;">
+                <p style="margin-top: 0; font-size: 15px;">Xin chào <strong>${safeName}</strong>,</p>
+                <p style="font-size: 14.5px; color: #374151;">
+                    Hệ thống đã tiếp nhận yêu cầu <strong>Quên mật khẩu</strong> qua Gmail cá nhân cho tài khoản <strong>${roleLabel}</strong> của bạn. Dưới đây là email đăng nhập nội bộ hiện có và mật khẩu tạm thời mới:
+                </p>
+
+                <div style="background-color: #FFFDF7; border: 1.5px dashed #D97706; border-radius: 8px; padding: 20px; margin: 24px 0;">
+                    <h3 style="margin-top: 0; margin-bottom: 14px; color: #92400E; font-size: 16px; border-bottom: 1px solid #FDE68A; padding-bottom: 8px;">
+                        Thông tin đăng nhập Cổng quản trị:
+                    </h3>
+
+                    <div style="margin-bottom: 12px; background-color: #FFFFFF; border: 1px solid #CBD5E1; border-radius: 6px; padding: 12px 16px;">
+                        <div style="font-size: 11.5px; font-weight: 700; color: #64748B; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;">
+                            Email đăng nhập nội bộ
+                        </div>
+                        <div style="font-family: Consolas, 'Courier New', monospace; font-size: 15px; font-weight: 700; color: #0F172A; user-select: all; -webkit-user-select: all; word-break: break-all;">
+                            ${safeInternalEmail}
+                        </div>
+                    </div>
+
+                    <div style="margin-bottom: 20px; background-color: #FFFDF0; border: 1px solid #FCD34D; border-radius: 6px; padding: 12px 16px;">
+                        <div style="font-size: 11.5px; font-weight: 700; color: #92400E; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;">
+                            Mật khẩu tạm thời mới
+                        </div>
+                        <div style="font-family: Consolas, 'Courier New', monospace; font-size: 17px; font-weight: 800; color: #78350F; letter-spacing: 0.6px; user-select: all; -webkit-user-select: all; word-break: break-all;">
+                            ${safePassword}
+                        </div>
+                    </div>
+
+                    <div style="text-align: center;">
+                        <a href="${escapeMailHtml(loginUrl)}" style="background-color: #F4C542; color: #24220A; text-decoration: none; font-weight: bold; font-size: 14px; padding: 11px 26px; border-radius: 6px; display: inline-block; border: 1px solid #D6A82C;">
+                            Đăng nhập Cổng quản trị &rarr;
+                        </a>
+                    </div>
+                </div>
+
+                <div style="background-color: #FFFBEB; border-left: 4px solid #F59E0B; padding: 14px 16px; margin-bottom: 20px; border-radius: 0 6px 6px 0;">
+                    <p style="margin: 0; font-size: 13.5px; color: #92400E; line-height: 1.5;">
+                        <strong>Lưu ý bảo mật:</strong> Đây là mật khẩu tạm thời. Khi đăng nhập lại vào hệ thống, bạn sẽ được yêu cầu thiết lập mật khẩu mới để bảo vệ tài khoản.
+                    </p>
+                </div>
+
+                <p style="font-size: 13px; color: #64748B; margin-bottom: 0;">
+                    Nếu bạn không thực hiện yêu cầu này, vui lòng liên hệ Quản trị viên cấp cao ngay lập tức.
+                </p>
+            </div>
+
+            <div style="background-color: #F8FAFC; border-top: 1px solid #E2E8F0; padding: 16px 20px; text-align: center; font-size: 12px; color: #64748B;">
+                © VietPeace Stay Hospitality. Email tự động từ hệ thống quản trị nội bộ, vui lòng không trả lời thư này.
+            </div>
+        </div>
+    `;
+
+    return sendTransactionalHtmlMail({
+        toEmail: toPersonalEmail,
+        subject,
+        textContent,
+        htmlContent,
+        logContext: "email khôi phục tài khoản Admin/Manager",
+    });
 }
 
 module.exports = {
     sendAccountProvisionEmail,
     sendPasswordResetEmail,
+    sendAdminPortalForgotPasswordEmail,
     sendManagerFinancialWarningEmail,
     sendManagerBonusAndTetRewardEmail,
     sendChatCskhWarningEmail,
     sendCustomerVerificationEmail,
+    sendCustomerNewPasswordEmail,
 };

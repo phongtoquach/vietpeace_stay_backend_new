@@ -25,7 +25,7 @@ async function getRolePermissionsMatrix(req, res) {
 async function updateRolePermissions(req, res) {
     try {
         // Chỉ ADMIN mới có quyền sửa ma trận phân quyền
-        if (req.currentAdmin?.role !== "ADMIN" && req.session?.admin?.role !== "ADMIN") {
+        if ((req.currentAdmin || req.session?.admin)?.role !== "ADMIN") {
             return res.status(403).json({
                 success: false,
                 message: "Bạn không có quyền thay đổi cấu hình phân quyền hệ thống.",
@@ -46,9 +46,10 @@ async function updateRolePermissions(req, res) {
         return res.status(200).json(result);
     } catch (error) {
         console.error("[updateRolePermissions] error:", error);
-        return res.status(500).json({
+        return res.status(error.statusCode || 500).json({
             success: false,
             message: error.message || "Không thể cập nhật ma trận phân quyền.",
+            errorCode: error.errorCode,
         });
     }
 }

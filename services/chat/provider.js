@@ -79,12 +79,13 @@ async function generate({ contents, system, tools = [], signal, onDelta = async 
       lastOpenErr = null;
       break;
     } catch (err) {
+      if (signal?.aborted) throw chatError(499, "AI_CANCELLED", "Phản hồi AI đã được hủy.");
       lastOpenErr = err;
       if (attempt < RETRY_DELAYS_MS.length && isTransientProviderError(err) && !signal?.aborted) {
         await sleepAbortable(RETRY_DELAYS_MS[attempt], signal);
         continue;
       }
-      const status = err?.status || 503;
+      const status = Number(err?.status || 503);
       const code = status === 429 ? "AI_QUOTA_EXCEEDED" : "AI_PROVIDER_ERROR";
       throw chatError(503, code, `Dịch vụ AI tạm thời không khả dụng (${err?.message || "Provider Error"}).`);
     }
@@ -122,26 +123,12 @@ async function generate({ contents, system, tools = [], signal, onDelta = async 
     }
   } catch (err) {
     if (err?.errorCode) throw err;
+    if (signal?.aborted) throw chatError(499, "AI_CANCELLED", "Phản hồi AI đã được hủy.");
     throw chatError(503, "AI_STREAM_ERROR", `Luồng phản hồi AI bị gián đoạn (${err?.message || "Stream Error"}).`);
   }
 
-  // Merge contiguous text parts while preserving functionCall & thoughtSignature parts intact for multi-turn tool calls
-  const mergedParts = [];
-  let pendingText = "";
-  for (const part of rawParts) {
-    if (!part.thought && !part.functionCall && typeof part.text === "string") {
-      pendingText += part.text;
-    } else {
-      if (pendingText) {
-        mergedParts.push({ text: pendingText });
-        pendingText = "";
-      }
-      if (!part.thought) {
-        mergedParts.push(part);
-      }
-    }
-  }
-  if (pendingText) mergedParts.push({ text: pendingText });
+  // Keep provider parts intact: text and thought parts can carry signatures needed
+  // by the next tool round. Only visible text is forwarded through onDelta above.
 
   if (!text && functionCalls.length === 0) {
     throw chatError(503, "AI_EMPTY_RESPONSE", "AI chưa tạo được nội dung phản hồi phù hợp.");
@@ -150,7 +137,7 @@ async function generate({ contents, system, tools = [], signal, onDelta = async 
   return {
     model,
     text,
-    content: { role: "model", parts: mergedParts },
+    content: { role: "model", parts: rawParts },
     calls: functionCalls,
     usage,
   };

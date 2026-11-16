@@ -46,7 +46,8 @@ async function requireAdminLogin(req, res, next) {
             // Đồng bộ session
             req.session.admin.fullName = currentAdmin.full_name;
             req.session.admin.displayName = currentAdmin.display_name;
-            req.session.admin.personalEmail = currentAdmin.personal_email;
+            req.session.admin.personalEmail = currentAdmin.personal_email || null;
+            req.session.admin.phoneNumber = currentAdmin.phone_number || "";
             req.session.admin.role = currentAdmin.role;
             req.session.admin.status = currentAdmin.status;
             req.session.admin.mustChangePassword = Boolean(currentAdmin.must_change_password);

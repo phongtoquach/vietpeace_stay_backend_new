@@ -2,6 +2,10 @@ const express = require("express");
 const router = express.Router();
 
 const attractionController = require("../../controllers/admin/attraction/attractionController");
+const requireAdminLogin = require("../../middlewares/requireAdminLogin");
+const requireRole = require("../../middlewares/requireRole");
+
+router.use(requireAdminLogin, requireRole("ADMIN"));
 
 // 1. Lấy danh sách điểm tham quan (có hỗ trợ lọc theo location_id, search, status, phân trang)
 router.get("/", attractionController.getAttractionsList);

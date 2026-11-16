@@ -15,7 +15,6 @@ async function revokeCustomerSession(req, res) {
 
 
 async function requireCustomerLogin(req, res, next) {
-    console.log("[requireCustomerLogin] req.session : ", req.session);
 
     if (!req.session.customer) {
         return res.status(401).json({
@@ -27,7 +26,6 @@ async function requireCustomerLogin(req, res, next) {
 
     // check dòng user có id là req.session.customer.id trong bảng users
     const currentCustomer_res = await authService.getCustomerDataById(req.session.customer.id);
-    console.log("[requireCustomerLogin] Data của currentCustomer_res : ", currentCustomer_res);
     if (!currentCustomer_res.success) {
         console.log("[requireCustomerLogin] currentCustomer_res.success = false ! Thu hồi session authen của user !");
 
@@ -42,7 +40,6 @@ async function requireCustomerLogin(req, res, next) {
     }
 
     const currentCustomer = currentCustomer_res.data.customer;
-    console.log("[requireCustomerLogin] Data của currentCustomer : ", currentCustomer);
 
     // check status của customer
     if (currentCustomer.status !== 1) {
@@ -60,9 +57,10 @@ async function requireCustomerLogin(req, res, next) {
 
     console.log("[requireCustomerLogin] currentCustomer hop le ! Cho di tiep !");
 
+    req.session.customer.email = currentCustomer.email;
     req.session.customer.fullName = currentCustomer.full_name;
-    req.session.customer.displayName = currentCustomer.display_name;
-    //req.session.customer.phoneNumber = currentCustomer.phone_number;
+    req.session.customer.displayName = currentCustomer.display_name || currentCustomer.full_name;
+    req.session.customer.phoneNumber = currentCustomer.phone_number || "";
 
     next();
 }
