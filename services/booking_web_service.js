@@ -5,8 +5,22 @@ const { randomInt, randomUUID } = require("node:crypto");
 const { createBookingCheckout } = require("./booking_checkout_service");
 
 const DAY_MS = 86_400_000;
-const MAX_STAY_NIGHTS = 90;
 const MAX_SQL_INT = 2_147_483_647;
+
+const DEFAULT_MAX_STAY_NIGHTS = 45;
+const STAYDATELIMIT = 1096;
+const configuredMaxStayNights = process.env.MAX_STAY_NIGHTS?.trim() ?? "";
+const maxStayNights = Number(configuredMaxStayNights);
+
+const MAX_STAY_NIGHTS =
+    /^\d+$/.test(configuredMaxStayNights) &&
+    maxStayNights >= 1 &&
+    maxStayNights <= STAYDATELIMIT
+        ? maxStayNights
+        : DEFAULT_MAX_STAY_NIGHTS;
+
+console.log("[booking web search ] MAX_STAY_NIGHTS sau cung : ", MAX_STAY_NIGHTS);
+
 
 function badRequest(message) {
     return Object.assign(new Error(message), { statusCode: 400 });
@@ -41,8 +55,29 @@ function readDate(value, field) {
     return timestamp;
 }
 
+const vietnamDateFormatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Ho_Chi_Minh",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+});
+
+function getTodayInVietnam() {
+    const parts = vietnamDateFormatter.formatToParts(new Date());
+    const year = parts.find((part) => part.type === "year").value;
+    const month = parts.find((part) => part.type === "month").value;
+    const day = parts.find((part) => part.type === "day").value;
+
+    return `${year}-${month}-${day}`;
+}
+
 function readStay({ checkinDate, checkoutDate, rooms = 1 }) {
     const start = readDate(checkinDate, "checkinDate");
+
+    if (checkinDate < getTodayInVietnam()) {
+        throw badRequest("Ngày nhận phòng không được trước ngày hiện tại.");
+    }
+
     const end = readDate(checkoutDate, "checkoutDate");
     const totalNights = (end - start) / DAY_MS;
 

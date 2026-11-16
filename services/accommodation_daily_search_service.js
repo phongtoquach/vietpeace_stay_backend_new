@@ -1,8 +1,26 @@
 const db = require("../configs/database");
 const { sqlObj } = db;
 
-const MAX_STAY_NIGHTS = 90;
+const DEFAULT_MAX_STAY_NIGHTS = 45;
+const STAY_DATE_LIMIT = 1096;
+const configuredMaxStayNights = process.env.MAX_STAY_NIGHTS?.trim() ?? "";
+const maxStayNights = Number(configuredMaxStayNights);
+const MAX_STAY_NIGHTS =
+	/^\d+$/.test(configuredMaxStayNights) &&
+	maxStayNights >= 1 &&
+	maxStayNights <= STAY_DATE_LIMIT
+		? maxStayNights
+		: DEFAULT_MAX_STAY_NIGHTS;
+
+console.log("[accomm daily search ] MAX_STAY_NIGHTS sau cung : ", MAX_STAY_NIGHTS);
+
 const DAY_MS = 86_400_000;
+const vietnamDateFormatter = new Intl.DateTimeFormat("en-CA", {
+	timeZone: "Asia/Ho_Chi_Minh",
+	year: "numeric",
+	month: "2-digit",
+	day: "2-digit"
+});
 
 // ============================================================
 // Sort options
@@ -98,6 +116,15 @@ function parseDate(value, field, errors) {
 	}
 
 	return value;
+}
+
+function getTodayInVietnam() {
+	const parts = vietnamDateFormatter.formatToParts(new Date());
+	const year = parts.find((part) => part.type === "year").value;
+	const month = parts.find((part) => part.type === "month").value;
+	const day = parts.find((part) => part.type === "day").value;
+
+	return `${year}-${month}-${day}`;
 }
 
 function parsePrice(value, field, errors) {
@@ -257,6 +284,10 @@ function normalizeFilters(filters) {
 		return failure("DATA_INVALID", "Tiêu chí tìm kiếm không hợp lệ.", errors);
 	}
 
+	if (normalized.checkinDate && normalized.checkinDate < getTodayInVietnam()) {
+		errors.checkinDate = "Ngày nhận phòng không được trước ngày hiện tại.";
+	}
+
 	// Phải có cả hai ngày hoặc không có ngày nào.
 	if (Boolean(normalized.checkinDate) !== Boolean(normalized.checkoutDate)) {
 		const missingField = normalized.checkinDate ? "checkoutDate" : "checkinDate";
@@ -266,7 +297,7 @@ function normalizeFilters(filters) {
 
 	if (normalized.checkinDate && normalized.checkoutDate) {
 		if (normalized.checkoutDate <= normalized.checkinDate) {
-			errors.checkoutDate = "checkoutDate phải sau checkinDate.";
+			errors.checkoutDate = "Ngày trả phòng phải sau ngày nhận phòng.";
 		} else if ((Date.parse(normalized.checkoutDate) - Date.parse(normalized.checkinDate)) / DAY_MS > MAX_STAY_NIGHTS) {
 			errors.checkoutDate = `Kỳ lưu trú tối đa ${MAX_STAY_NIGHTS} đêm.`;
 		}
