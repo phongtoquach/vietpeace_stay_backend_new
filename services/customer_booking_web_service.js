@@ -1,5 +1,7 @@
 const { sqlObj, getDBPool } = require('../configs/database');
 
+const { inferBookingTaxRatePercent } = require('../utils/bookingTax');
+
 async function getBookingDetail(bookingId, customerId) {
     if (!customerId) {
         throw Object.assign(
@@ -191,6 +193,16 @@ async function getBookingDetail(bookingId, customerId) {
         expiresAt: paymentExpiresAt,
         isSessionOpen: isPaymentSessionOpen,
     };
+
+    // tinh toan taxRatePercent
+    const taxRatePercentVal = inferBookingTaxRatePercent({
+        rooms_subtotal: booking.roomSubtotal,
+        extra_guest_total: booking.extraGuestsSubtotal,
+        tax_amount: booking.taxAmount
+    });
+    console.log("[getBookingDetail service] taxRatePercentVal tinh ra la : ", taxRatePercentVal);
+
+    booking.taxRatePercent = taxRatePercentVal;
 
     return {
         ...booking,

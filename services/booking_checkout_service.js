@@ -2,6 +2,8 @@ const { createHash, createHmac, randomBytes } = require("node:crypto");
 const { sqlObj: sql, getDBPool } = require("../configs/database");
 const { getCustomerDataById } = require("./auth_service");
 
+const { inferBookingTaxRatePercent } = require('../utils/bookingTax');
+
 const PAYMENT_MINUTES = 15;
 const MAX_BIGINT = 9223372036854775807n;
 const NOT_FOUND = "Không tìm thấy thông tin đặt phòng cần thanh toán.";
@@ -229,7 +231,8 @@ function blocked(state, message, extra = {}) {
 }
 
 function serializeBooking(booking, items) {
-    const taxBpsVal = Number(process.env.BOOKING_TAX_BPS ?? 0);
+    const taxRatePercentVal = inferBookingTaxRatePercent(booking);
+    console.log("[serializeBooking] taxRatePercentVal tinh ra la : ", taxRatePercentVal);
 
     return {
         id: booking.checkout_id,
@@ -256,7 +259,7 @@ function serializeBooking(booking, items) {
         extraGuestsSubtotal: Number(booking.extra_guest_total),
         roomDiscountTotal: Number(booking.room_discount_total),
         discountAmount: Number(booking.discount_amount),
-        taxRatePercent: taxBpsVal / 100,
+        taxRatePercent: taxRatePercentVal,
         taxAmount: Number(booking.tax_amount),
         serviceFee: Number(booking.service_fee),
         totalAmount: Number(booking.total_amount),
