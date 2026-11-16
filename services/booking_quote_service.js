@@ -61,6 +61,7 @@ function calculateQuote(accommodationId, selectedRooms, roomById, totalNights) {
     extraGuestTotal: fromCents(extraGuestTotal),
     roomDiscountTotal: 0,
     discountAmount: 0,
+    taxRatePercent: TAX_BPS / 100,
     taxAmount: fromCents(taxAmount),
     totalAmount: fromCents(taxableAmount + taxAmount),
     selectedRooms: quotedRooms,

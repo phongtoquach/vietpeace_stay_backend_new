@@ -229,6 +229,8 @@ function blocked(state, message, extra = {}) {
 }
 
 function serializeBooking(booking, items) {
+    const taxBpsVal = Number(process.env.BOOKING_TAX_BPS ?? 0);
+
     return {
         id: booking.checkout_id,
         status: booking.status,
@@ -254,6 +256,7 @@ function serializeBooking(booking, items) {
         extraGuestsSubtotal: Number(booking.extra_guest_total),
         roomDiscountTotal: Number(booking.room_discount_total),
         discountAmount: Number(booking.discount_amount),
+        taxRatePercent: taxBpsVal / 100,
         taxAmount: Number(booking.tax_amount),
         serviceFee: Number(booking.service_fee),
         totalAmount: Number(booking.total_amount),
