@@ -64,8 +64,8 @@ function createStrictImageUpload(subFolder) {
 const roomTypeUpload = createStrictImageUpload("room_types");
 const checkoutEvidenceUpload = createStrictImageUpload("checkout_evidence");
 
-router.post("/accommodations", upload.single("file"), uploadAccommodationImage);
-router.post("/room-types", roomTypeUpload.single("file"), uploadRoomTypeImage);
+router.post("/accommodations", requirePermission("accommodations.write"), upload.single("file"), uploadAccommodationImage);
+router.post("/room-types", requirePermission("accommodations.write"), roomTypeUpload.single("file"), uploadRoomTypeImage);
 router.post(
   "/checkout-evidence",
   requirePermission("bookings.write"),

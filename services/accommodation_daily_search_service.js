@@ -179,6 +179,7 @@ function normalizeFilters(filters) {
 		),
 
 		accommodationTypeIds: parseIdList(filters.accommodationTypeIds, "accommodationTypeIds", errors),
+		accommodationIds: parseIdList(filters.accommodationIds, "accommodationIds", errors),
 
 		accommodationType: null,
 
@@ -423,6 +424,9 @@ async function searchAccommodationsByFilters(filters = {}, sort = "default", pag
 
 	if (hasAccommodationId) {
 		conditions.push("a.id = @accommodationId");
+	}
+	if (filters.accommodationIds.length > 0) {
+		conditions.push("a.id IN (SELECT id FROM OPENJSON(@accommodationIds) WITH (id INT '$'))");
 	}
 
 	if (filters.accommodationTypeIds.length > 0) {
@@ -673,6 +677,7 @@ async function searchAccommodationsByFilters(filters = {}, sort = "default", pag
 	request
 		.input("locationId", sqlObj.Int, filters.locationId)
 		.input("accommodationId", sqlObj.Int, filters.accommodationId)
+		.input("accommodationIds", sqlObj.NVarChar(sqlObj.MAX), JSON.stringify(filters.accommodationIds))
 		.input("accommodationTypeIds", sqlObj.NVarChar(sqlObj.MAX), JSON.stringify(filters.accommodationTypeIds))
 		.input("accommodationType", sqlObj.VarChar(100), filters.accommodationType)
 		.input("rooms", sqlObj.Int, filters.rooms)

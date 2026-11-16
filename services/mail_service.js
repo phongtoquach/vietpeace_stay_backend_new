@@ -766,9 +766,124 @@ async function sendCustomerNewPasswordEmail({
     });
 }
 
+/**
+ * Gửi email khôi phục thông tin đăng nhập nội bộ + mật khẩu tạm thời mới tới Gmail cá nhân của Admin/Manager
+ */
+async function sendAdminPortalForgotPasswordEmail({
+    toPersonalEmail,
+    fullName,
+    role,
+    accommodationName,
+    internalEmail,
+    newPassword,
+}) {
+    const adminBase = (process.env.ADMIN_PANEL_DOMAIN || "http://localhost:5175")
+        .trim()
+        .replace(/^["']|["']$/g, "")
+        .replace(/\/+$/, "");
+    const loginUrlObj = new URL("/login", adminBase);
+    if (internalEmail) {
+        loginUrlObj.searchParams.set("email", internalEmail);
+    }
+    const loginUrl = loginUrlObj.toString();
+
+    const safeName = escapeMailHtml(fullName || "Quản trị viên");
+    const safeInternalEmail = escapeMailHtml(internalEmail || "");
+    const safePassword = escapeMailHtml(newPassword || "");
+    const safeAccom = accommodationName ? escapeMailHtml(accommodationName) : "";
+    const roleLabel = role === "ADMIN"
+        ? "Quản trị viên cấp cao (ADMIN)"
+        : safeAccom
+            ? `Quản lý cơ sở — ${safeAccom}`
+            : "Quản lý cơ sở (ACCOMMODATION_MANAGER)";
+
+    const subject = "[VietPeace Stay] Khôi phục tài khoản & mật khẩu mới cổng Quản trị";
+
+    const textContent = [
+        `Xin chào ${fullName || "Quản trị viên"},`,
+        "",
+        "Chúng tôi đã tiếp nhận yêu cầu khôi phục thông tin đăng nhập Cổng quản trị VietPeace Stay qua email cá nhân của bạn.",
+        `Vai trò: ${role === "ADMIN" ? "Quản trị viên cấp cao (ADMIN)" : `Quản lý cơ sở${accommodationName ? ` — ${accommodationName}` : ""}`}`,
+        `Email đăng nhập nội bộ: ${internalEmail}`,
+        `Mật khẩu tạm thời mới: ${newPassword}`,
+        "",
+        `Đăng nhập tại: ${loginUrl}`,
+        "Lưu ý bảo mật: Ngay sau khi đăng nhập bằng mật khẩu tạm thời mới, hệ thống sẽ yêu cầu bạn đổi lại mật khẩu cá nhân.",
+    ].join("\n");
+
+    const htmlContent = `
+        <div style="font-family: Arial, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #292D32; max-width: 620px; margin: 0 auto; border: 1px solid #E5E7EB; border-radius: 10px; overflow: hidden; background-color: #ffffff; box-shadow: 0 4px 12px rgba(0,0,0,0.06);">
+            <div style="background: linear-gradient(135deg, #78350F 0%, #B45309 45%, #D97706 100%); color: #ffffff; padding: 28px 24px; text-align: center;">
+                <h1 style="margin: 0; font-size: 22px; font-weight: 800; letter-spacing: 0.5px; text-transform: uppercase;">VIETPEACE STAY HOSPITALITY</h1>
+                <p style="margin: 6px 0 0; font-size: 13.5px; color: #FEF3C7; opacity: 0.95; font-weight: 500;">KHÔI PHỤC TÀI KHOẢN NỘI BỘ &amp; MẬT KHẨU MỚI</p>
+            </div>
+
+            <div style="padding: 28px 24px;">
+                <p style="margin-top: 0; font-size: 15px;">Xin chào <strong>${safeName}</strong>,</p>
+                <p style="font-size: 14.5px; color: #374151;">
+                    Hệ thống đã tiếp nhận yêu cầu <strong>Quên mật khẩu</strong> qua Gmail cá nhân cho tài khoản <strong>${roleLabel}</strong> của bạn. Dưới đây là email đăng nhập nội bộ hiện có và mật khẩu tạm thời mới:
+                </p>
+
+                <div style="background-color: #FFFDF7; border: 1.5px dashed #D97706; border-radius: 8px; padding: 20px; margin: 24px 0;">
+                    <h3 style="margin-top: 0; margin-bottom: 14px; color: #92400E; font-size: 16px; border-bottom: 1px solid #FDE68A; padding-bottom: 8px;">
+                        Thông tin đăng nhập Cổng quản trị:
+                    </h3>
+
+                    <div style="margin-bottom: 12px; background-color: #FFFFFF; border: 1px solid #CBD5E1; border-radius: 6px; padding: 12px 16px;">
+                        <div style="font-size: 11.5px; font-weight: 700; color: #64748B; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;">
+                            Email đăng nhập nội bộ
+                        </div>
+                        <div style="font-family: Consolas, 'Courier New', monospace; font-size: 15px; font-weight: 700; color: #0F172A; user-select: all; -webkit-user-select: all; word-break: break-all;">
+                            ${safeInternalEmail}
+                        </div>
+                    </div>
+
+                    <div style="margin-bottom: 20px; background-color: #FFFDF0; border: 1px solid #FCD34D; border-radius: 6px; padding: 12px 16px;">
+                        <div style="font-size: 11.5px; font-weight: 700; color: #92400E; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;">
+                            Mật khẩu tạm thời mới
+                        </div>
+                        <div style="font-family: Consolas, 'Courier New', monospace; font-size: 17px; font-weight: 800; color: #78350F; letter-spacing: 0.6px; user-select: all; -webkit-user-select: all; word-break: break-all;">
+                            ${safePassword}
+                        </div>
+                    </div>
+
+                    <div style="text-align: center;">
+                        <a href="${escapeMailHtml(loginUrl)}" style="background-color: #F4C542; color: #24220A; text-decoration: none; font-weight: bold; font-size: 14px; padding: 11px 26px; border-radius: 6px; display: inline-block; border: 1px solid #D6A82C;">
+                            Đăng nhập Cổng quản trị &rarr;
+                        </a>
+                    </div>
+                </div>
+
+                <div style="background-color: #FFFBEB; border-left: 4px solid #F59E0B; padding: 14px 16px; margin-bottom: 20px; border-radius: 0 6px 6px 0;">
+                    <p style="margin: 0; font-size: 13.5px; color: #92400E; line-height: 1.5;">
+                        <strong>Lưu ý bảo mật:</strong> Đây là mật khẩu tạm thời. Khi đăng nhập lại vào hệ thống, bạn sẽ được yêu cầu thiết lập mật khẩu mới để bảo vệ tài khoản.
+                    </p>
+                </div>
+
+                <p style="font-size: 13px; color: #64748B; margin-bottom: 0;">
+                    Nếu bạn không thực hiện yêu cầu này, vui lòng liên hệ Quản trị viên cấp cao ngay lập tức.
+                </p>
+            </div>
+
+            <div style="background-color: #F8FAFC; border-top: 1px solid #E2E8F0; padding: 16px 20px; text-align: center; font-size: 12px; color: #64748B;">
+                © VietPeace Stay Hospitality. Email tự động từ hệ thống quản trị nội bộ, vui lòng không trả lời thư này.
+            </div>
+        </div>
+    `;
+
+    return sendTransactionalHtmlMail({
+        toEmail: toPersonalEmail,
+        subject,
+        textContent,
+        htmlContent,
+        logContext: "email khôi phục tài khoản Admin/Manager",
+    });
+}
+
 module.exports = {
     sendAccountProvisionEmail,
     sendPasswordResetEmail,
+    sendAdminPortalForgotPasswordEmail,
     sendManagerFinancialWarningEmail,
     sendManagerBonusAndTetRewardEmail,
     sendChatCskhWarningEmail,

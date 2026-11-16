@@ -290,6 +290,7 @@ async function getAdminUserById(userId) {
                 u.personal_email,
                 u.full_name,
                 u.display_name,
+                u.phone_number,
                 u.role,
                 u.status,
                 u.must_change_password,
@@ -323,14 +324,16 @@ async function getAdminUserById(userId) {
  * Đổi mật khẩu lần đầu (bắt buộc đối với tài khoản cấp phát tạm thời)
  */
 async function changeInitialPassword(userId, newPassword) {
-    if (!newPassword || typeof newPassword !== "string" || newPassword.trim().length < 8) {
-        return failure("PASSWORD_TOO_SHORT", "Mật khẩu mới phải có ít nhất 8 ký tự.", {
-            newPassword: "Mật khẩu mới phải có ít nhất 8 ký tự."
+    const newPasswordError = validatePasswordField(newPassword, "newPassword", "Mật khẩu mới");
+    if (newPasswordError) {
+        return failure("PASSWORD_INVALID", newPasswordError, {
+            newPassword: newPasswordError,
         });
     }
 
     const salt = await bcrypt.genSalt(10);
-    const passwordHash = await bcrypt.hash(newPassword.trim(), salt);
+    // Không trim password vì khoảng trắng có thể thuộc mật khẩu giống luồng login().
+    const passwordHash = await bcrypt.hash(newPassword, salt);
 
     const pool = getDBPool();
     const result = await pool.request()
@@ -343,16 +346,479 @@ async function changeInitialPassword(userId, newPassword) {
                 password_change_at = SYSDATETIME(),
                 updated_at = SYSDATETIME()
             OUTPUT INSERTED.id, INSERTED.email, INSERTED.must_change_password
-            WHERE id = @id;
+            WHERE id = @id
+              AND role IN ('ADMIN', 'ACCOMMODATION_MANAGER')
+              AND status = 1;
         `);
 
     if (result.recordset.length === 0) {
-        return failure("USER_NOT_FOUND", "Không tìm thấy thông tin người dùng.");
+        return failure("USER_NOT_FOUND", "Không tìm thấy thông tin người dùng hợp lệ.");
     }
+
+    invalidateActorAuthCache(userId);
 
     return {
         success: true,
         message: "Đổi mật khẩu thành công. Tài khoản của bạn đã được kích hoạt hoàn toàn."
+    };
+}
+
+/**
+ * Đổi mật khẩu chủ động trong Admin Panel (bắt buộc xác thực mật khẩu hiện tại)
+ */
+async function changeAdminPassword(userId, body) {
+    if (!userId) {
+        return failure("UNAUTHENTICATED", "Vui lòng đăng nhập vào Admin Panel.");
+    }
+
+    if (!isValidBody(body)) {
+        return failure("DATA_INVALID", "Request body không hợp lệ.");
+    }
+
+    const currentPassword = body.currentPassword ?? body.oldPassword;
+    const newPassword = body.newPassword ?? body.password;
+    const confirmPassword = body.confirmPassword ?? body.confirmNewPassword;
+
+    const errors = {};
+    if (!currentPassword || typeof currentPassword !== "string") {
+        errors.currentPassword = "Vui lòng nhập mật khẩu hiện tại.";
+    }
+
+    const newPasswordError = validatePasswordField(newPassword, "newPassword", "Mật khẩu mới");
+    if (newPasswordError) {
+        errors.newPassword = newPasswordError;
+    }
+
+    if (confirmPassword !== undefined) {
+        if (typeof confirmPassword !== "string" || confirmPassword !== newPassword) {
+            errors.confirmPassword = "Mật khẩu xác nhận chưa khớp.";
+        }
+    }
+
+    if (!errors.currentPassword && !errors.newPassword && currentPassword === newPassword) {
+        errors.newPassword = "Mật khẩu mới phải khác mật khẩu hiện tại.";
+    }
+
+    if (Object.keys(errors).length > 0) {
+        return failure("DATA_INVALID", "Vui lòng kiểm tra lại thông tin đổi mật khẩu.", errors);
+    }
+
+    const pool = getDBPool();
+    const userRes = await pool
+        .request()
+        .input("id", sql.UniqueIdentifier, userId)
+        .query(`
+            SELECT id, password_hash, role, status
+            FROM dbo.users
+            WHERE id = @id;
+        `);
+
+    const userRow = userRes.recordset[0] || null;
+    if (!userRow || !isAdminPanelRole(userRow.role)) {
+        return failure("USER_NOT_FOUND", "Không tìm thấy tài khoản quản trị.");
+    }
+
+    if (userRow.status !== 1) {
+        return failure("ACCOUNT_INACTIVE", "Tài khoản đã bị khóa hoặc ngừng hoạt động.");
+    }
+
+    const passwordMatches = await bcrypt.compare(currentPassword, userRow.password_hash);
+    if (!passwordMatches) {
+        return failure(
+            "WRONG_CURRENT_PASSWORD",
+            "Mật khẩu hiện tại không chính xác.",
+            { currentPassword: "Mật khẩu hiện tại không chính xác." }
+        );
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, 12);
+    const updateRes = await pool
+        .request()
+        .input("id", sql.UniqueIdentifier, userId)
+        .input("passwordHash", sql.VarChar(255), passwordHash)
+        .query(`
+            UPDATE dbo.users
+            SET password_hash = @passwordHash,
+                must_change_password = 0,
+                password_change_at = SYSDATETIME(),
+                updated_at = SYSDATETIME()
+            WHERE id = @id
+              AND role IN ('ADMIN', 'ACCOMMODATION_MANAGER')
+              AND status = 1;
+        `);
+
+    if (!updateRes.rowsAffected || updateRes.rowsAffected[0] === 0) {
+        return failure("ACCOUNT_INACTIVE", "Không thể đổi mật khẩu lúc này.");
+    }
+
+    invalidateActorAuthCache(userId);
+
+    return {
+        success: true,
+        message: "Đã cập nhật mật khẩu tài khoản thành công.",
+    };
+}
+
+/**
+ * Cập nhật hồ sơ cá nhân của Admin / Manager (bao gồm bổ sung Email cá nhân để khôi phục mật khẩu)
+ */
+async function updateAdminOwnProfile(userId, body) {
+    if (!userId) {
+        return failure("UNAUTHENTICATED", "Vui lòng đăng nhập vào Admin Panel.");
+    }
+
+    if (!isValidBody(body)) {
+        return failure("DATA_INVALID", "Request body không hợp lệ.");
+    }
+
+    const rawFullName = body.fullName ?? body.full_name;
+    const fullName = typeof rawFullName === "string" ? rawFullName.trim() : "";
+
+    const rawPhone = body.phoneNumber ?? body.phone ?? body.phone_number;
+    const hasPhoneKey =
+        Object.prototype.hasOwnProperty.call(body, "phoneNumber") ||
+        Object.prototype.hasOwnProperty.call(body, "phone") ||
+        Object.prototype.hasOwnProperty.call(body, "phone_number");
+
+    const rawPersonalEmail = body.personalEmail ?? body.personal_email;
+    const hasPersonalEmailKey =
+        Object.prototype.hasOwnProperty.call(body, "personalEmail") ||
+        Object.prototype.hasOwnProperty.call(body, "personal_email");
+
+    const errors = {};
+    if (!fullName) {
+        errors.fullName = "Vui lòng nhập họ và tên.";
+    } else if (fullName.length > 255) {
+        errors.fullName = "Họ và tên không được vượt quá 255 ký tự.";
+    }
+
+    let cleanPhone = null;
+    if (hasPhoneKey && rawPhone !== undefined && rawPhone !== null) {
+        if (typeof rawPhone !== "string") {
+            errors.phoneNumber = "Số điện thoại không hợp lệ.";
+        } else {
+            const stripped = rawPhone.trim().replace(/[\s().-]/g, "");
+            if (stripped) {
+                if (!/^\+?\d{8,15}$/.test(stripped)) {
+                    errors.phoneNumber = "Số điện thoại phải gồm 8–15 chữ số hợp lệ.";
+                } else {
+                    cleanPhone = stripped;
+                }
+            }
+        }
+    }
+
+    let cleanPersonalEmail = undefined;
+    if (hasPersonalEmailKey) {
+        if (rawPersonalEmail === null || rawPersonalEmail === "") {
+            cleanPersonalEmail = "";
+        } else if (typeof rawPersonalEmail !== "string") {
+            errors.personalEmail = "Email cá nhân không hợp lệ.";
+        } else {
+            const trimmed = rawPersonalEmail.trim().toLowerCase();
+            if (!trimmed) {
+                cleanPersonalEmail = "";
+            } else if (trimmed.length > 255 || !EMAIL_REGEX.test(trimmed)) {
+                errors.personalEmail = "Email cá nhân không đúng định dạng.";
+            } else {
+                cleanPersonalEmail = trimmed;
+            }
+        }
+    }
+
+    if (Object.keys(errors).length > 0) {
+        return failure("DATA_INVALID", "Vui lòng kiểm tra lại thông tin hồ sơ.", errors);
+    }
+
+    const pool = getDBPool();
+    const existingRes = await pool
+        .request()
+        .input("id", sql.UniqueIdentifier, userId)
+        .query(`
+            SELECT id, email, personal_email, full_name, display_name, phone_number, role, status
+            FROM dbo.users
+            WHERE id = @id;
+        `);
+
+    const existing = existingRes.recordset[0] || null;
+    if (!existing || !isAdminPanelRole(existing.role)) {
+        return failure("USER_NOT_FOUND", "Không tìm thấy tài khoản quản trị.");
+    }
+
+    if (existing.status !== 1) {
+        return failure("ACCOUNT_INACTIVE", "Tài khoản đã bị khóa hoặc ngừng hoạt động.");
+    }
+
+    // Manager bắt buộc giữ email cá nhân; nếu đang cập nhật personalEmail mới -> kiểm tra trùng
+    let nextPersonalEmail = existing.personal_email || null;
+    if (cleanPersonalEmail !== undefined) {
+        if (!cleanPersonalEmail) {
+            if (existing.role === "ACCOMMODATION_MANAGER") {
+                return failure(
+                    "DATA_INVALID",
+                    "Tài khoản Quản lý cơ sở bắt buộc phải có email cá nhân.",
+                    { personalEmail: "Vui lòng nhập email cá nhân." }
+                );
+            }
+            nextPersonalEmail = null;
+        } else {
+            const dupEmail = await pool
+                .request()
+                .input("id", sql.UniqueIdentifier, userId)
+                .input("personalEmail", sql.VarChar(255), cleanPersonalEmail)
+                .query(`
+                    SELECT TOP 1 id
+                    FROM dbo.users
+                    WHERE id <> @id
+                      AND (
+                          LOWER(LTRIM(RTRIM(personal_email))) = @personalEmail
+                          OR LOWER(LTRIM(RTRIM(email))) = @personalEmail
+                      );
+                `);
+            if (dupEmail.recordset.length > 0) {
+                return failure(
+                    "EMAIL_ALREADY_EXISTS",
+                    `Email cá nhân "${cleanPersonalEmail}" đã được liên kết với một tài khoản khác trong hệ thống.`,
+                    { personalEmail: "Email cá nhân này đã được sử dụng cho tài khoản khác." }
+                );
+            }
+            nextPersonalEmail = cleanPersonalEmail;
+        }
+    }
+
+    const nextPhone = hasPhoneKey ? cleanPhone : (existing.phone_number || null);
+    if (nextPhone && existing.role === "ACCOMMODATION_MANAGER") {
+        const phoneKey = nextPhone.replace(/^(?:\+84|0084)/, "0");
+        const dupPhone = await pool
+            .request()
+            .input("id", sql.UniqueIdentifier, userId)
+            .input("phoneKey", sql.VarChar(20), phoneKey)
+            .query(`
+                SELECT TOP 1 u.id
+                FROM dbo.users u
+                CROSS APPLY (
+                    SELECT REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                        u.phone_number, ' ', ''), '-', ''), '.', ''), '(', ''), ')', ''), CHAR(9), '') AS phone
+                ) p
+                WHERE u.id <> @id
+                  AND u.role = 'ACCOMMODATION_MANAGER'
+                  AND CASE
+                        WHEN p.phone LIKE '+84%' THEN '0' + SUBSTRING(p.phone, 4, 20)
+                        WHEN p.phone LIKE '0084%' THEN '0' + SUBSTRING(p.phone, 5, 20)
+                        ELSE p.phone
+                      END = @phoneKey;
+            `);
+        if (dupPhone.recordset.length > 0) {
+            return failure(
+                "PHONE_ALREADY_EXISTS",
+                "Số điện thoại đã thuộc về một Quản lý cơ sở khác.",
+                { phoneNumber: "Số điện thoại đã thuộc về một Quản lý cơ sở khác." }
+            );
+        }
+    }
+
+    const updatedRes = await pool
+        .request()
+        .input("id", sql.UniqueIdentifier, userId)
+        .input("fullName", sql.NVarChar(255), fullName)
+        .input("displayName", sql.NVarChar(255), fullName)
+        .input("phoneNumber", sql.VarChar(20), nextPhone)
+        .input("personalEmail", sql.VarChar(255), nextPersonalEmail)
+        .query(`
+            UPDATE dbo.users
+            SET full_name = @fullName,
+                display_name = @displayName,
+                phone_number = @phoneNumber,
+                personal_email = @personalEmail,
+                updated_at = SYSDATETIME()
+            OUTPUT
+                INSERTED.id,
+                INSERTED.email,
+                INSERTED.personal_email,
+                INSERTED.full_name,
+                INSERTED.display_name,
+                INSERTED.phone_number,
+                INSERTED.role,
+                INSERTED.status,
+                INSERTED.must_change_password
+            WHERE id = @id
+              AND role IN ('ADMIN', 'ACCOMMODATION_MANAGER')
+              AND status = 1;
+        `);
+
+    if (updatedRes.recordset.length === 0) {
+        return failure("ACCOUNT_INACTIVE", "Không thể cập nhật hồ sơ lúc này.");
+    }
+
+    const row = updatedRes.recordset[0];
+    invalidateActorAuthCache(userId);
+
+    return {
+        success: true,
+        message: "Cập nhật hồ sơ cá nhân thành công.",
+        data: {
+            fullName: row.full_name,
+            displayName: row.display_name || row.full_name,
+            phoneNumber: row.phone_number || "",
+            personalEmail: row.personal_email || null,
+        },
+    };
+}
+
+/**
+ * Quên mật khẩu cho Admin & Manager:
+ * Nhập Gmail cá nhân đã đăng ký -> gửi email đăng nhập nội bộ hiện có + mật khẩu tạm thời mới về Gmail cá nhân đó.
+ */
+async function forgotAdminPortalPassword(body) {
+    if (!isValidBody(body)) {
+        return failure("DATA_INVALID", "Request body không hợp lệ.");
+    }
+
+    const rawPersonalEmail = body.personalEmail ?? body.email ?? "";
+    const personalEmail = typeof rawPersonalEmail === "string"
+        ? rawPersonalEmail.trim().toLowerCase()
+        : "";
+
+    if (!personalEmail) {
+        return failure(
+            "DATA_INVALID",
+            "Vui lòng nhập email cá nhân đã đăng ký.",
+            { personalEmail: "Vui lòng nhập email cá nhân đã đăng ký." }
+        );
+    }
+
+    if (personalEmail.length > 255 || !EMAIL_REGEX.test(personalEmail)) {
+        return failure(
+            "DATA_INVALID",
+            "Email cá nhân không đúng định dạng.",
+            { personalEmail: "Email cá nhân không đúng định dạng." }
+        );
+    }
+
+    const pool = getDBPool();
+    const found = await pool
+        .request()
+        .input("personalEmail", sql.VarChar(255), personalEmail)
+        .query(`
+            SELECT TOP 2
+                u.id,
+                u.email,
+                u.personal_email,
+                u.full_name,
+                u.role,
+                u.status,
+                m.accommodation_id,
+                a.accommodation_name
+            FROM dbo.users u
+            LEFT JOIN dbo.accommodation_managers m ON m.user_id = u.id
+            LEFT JOIN dbo.accommodations a ON a.id = m.accommodation_id AND a.deleted_at IS NULL
+            WHERE LOWER(LTRIM(RTRIM(u.personal_email))) = @personalEmail
+              AND u.role IN ('ADMIN', 'ACCOMMODATION_MANAGER')
+            ORDER BY CASE WHEN u.role = 'ADMIN' THEN 0 ELSE 1 END, u.created_at DESC;
+        `);
+
+    const user = found.recordset[0] || null;
+    if (!user) {
+        return failure(
+            "USER_EMAIL_NOT_EXISTED",
+            "Email cá nhân này chưa được liên kết với tài khoản Quản trị viên hoặc Quản lý cơ sở nào.",
+            { personalEmail: "Email cá nhân này chưa được đăng ký trong hệ thống quản trị." }
+        );
+    }
+
+    if (user.status === 2) {
+        return failure(
+            "ACCOUNT_INACTIVE",
+            "Tài khoản liên kết với email này đã ngừng hoạt động hoặc bị tạm khóa."
+        );
+    }
+
+    if (user.status !== 1) {
+        return failure(
+            "ACCOUNT_STATUS_INVALID",
+            "Trạng thái tài khoản không hợp lệ."
+        );
+    }
+
+    if (user.role === "ACCOMMODATION_MANAGER" && !user.accommodation_id) {
+        return failure(
+            "ACCOMMODATION_NOT_ASSIGNED",
+            "Tài khoản Quản lý của bạn chưa được phân công cơ sở lưu trú nên chưa thể đăng nhập hệ thống. Vui lòng liên hệ Quản trị viên cấp cao."
+        );
+    }
+
+    const cooldownKey = `admin:${user.id}`;
+    const now = Date.now();
+    for (const [k, expiresAt] of forgotPasswordCooldowns.entries()) {
+        if (expiresAt <= now) {
+            forgotPasswordCooldowns.delete(k);
+        }
+    }
+
+    const cooldownUntil = forgotPasswordCooldowns.get(cooldownKey);
+    if (cooldownUntil && cooldownUntil > now) {
+        const retryAfterSeconds = Math.max(1, Math.ceil((cooldownUntil - now) / 1000));
+        return failure(
+            "FORGOT_PASSWORD_TOO_FREQUENT",
+            `Vui lòng đợi ${retryAfterSeconds} giây trước khi gửi yêu cầu khôi phục tiếp theo.`,
+            {},
+            { retryAfterSeconds }
+        );
+    }
+
+    forgotPasswordCooldowns.set(cooldownKey, now + FORGOT_PASSWORD_COOLDOWN_SECONDS * 1000);
+
+    const newPassword = generateTemporaryPassword(12);
+    const passwordHash = await bcrypt.hash(newPassword, 12);
+
+    let mailResult;
+    try {
+        mailResult = await mailService.sendAdminPortalForgotPasswordEmail({
+            toPersonalEmail: user.personal_email,
+            fullName: user.full_name,
+            role: user.role,
+            accommodationName: user.accommodation_name || null,
+            internalEmail: user.email,
+            newPassword,
+        });
+    } catch {
+        forgotPasswordCooldowns.delete(cooldownKey);
+        return failure(
+            "EMAIL_DELIVERY_FAILED",
+            "Không thể gửi email khôi phục lúc này. Vui lòng thử lại sau."
+        );
+    }
+
+    if (!mailResult?.success) {
+        forgotPasswordCooldowns.delete(cooldownKey);
+        return failure(
+            "EMAIL_DELIVERY_FAILED",
+            "Không thể gửi email khôi phục đến Gmail cá nhân lúc này. Vui lòng kiểm tra cấu hình SMTP hoặc thử lại sau."
+        );
+    }
+
+    await pool
+        .request()
+        .input("id", sql.UniqueIdentifier, user.id)
+        .input("passwordHash", sql.VarChar(255), passwordHash)
+        .query(`
+            UPDATE dbo.users
+            SET password_hash = @passwordHash,
+                must_change_password = 1,
+                password_change_at = SYSDATETIME(),
+                updated_at = SYSDATETIME()
+            WHERE id = @id
+              AND role IN ('ADMIN', 'ACCOMMODATION_MANAGER')
+              AND status = 1;
+        `);
+
+    invalidateActorAuthCache(user.id);
+
+    return {
+        success: true,
+        personalEmail: user.personal_email,
+        cooldownSeconds: FORGOT_PASSWORD_COOLDOWN_SECONDS,
+        message: `Đã gửi email đăng nhập nội bộ và mật khẩu tạm thời mới tới ${user.personal_email}. Vui lòng kiểm tra hộp thư để đăng nhập.`,
     };
 }
 
@@ -1684,9 +2150,12 @@ module.exports = {
     verifyCustomerEmail,
     resendCustomerVerificationEmail,
     forgotCustomerPassword,
+    forgotAdminPortalPassword,
     logout,
     getAdminUserById,
     changeInitialPassword,
+    changeAdminPassword,
+    updateAdminOwnProfile,
     isAdminPanelRole,
     getCustomerDataById,
     getCustomerProfileById,

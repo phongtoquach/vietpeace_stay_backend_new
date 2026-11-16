@@ -286,6 +286,7 @@ async function executeSearchAccommodations(args, runContext) {
 
   const baseFilterBody = {
     ...(locId ? { locationId: locId } : {}),
+    ...(matchedAccomIds ? { accommodationIds: [...matchedAccomIds] } : {}),
     sort: "default",
     page: 1,
     pageSize: 20,

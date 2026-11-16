@@ -300,7 +300,16 @@ async function hardDeleteTemporaryConversation(tx, conversationId, { ownerKey, r
  * 2) TEMPORARY AI idle guest_ai_close_at <= now (3 min timeout -> immediate delete)
  * 3) TEMPORARY abandoned/cancelled temporary_cleanup_at <= now (5 min safety -> immediate delete)
  */
-async function processExpiryBatch() {
+let activeExpiryBatch = null;
+
+function processExpiryBatch() {
+  if (!activeExpiryBatch) {
+    activeExpiryBatch = runExpiryBatch().finally(() => { activeExpiryBatch = null; });
+  }
+  return activeExpiryBatch;
+}
+
+async function runExpiryBatch() {
   const pool = getDBPool();
 
   // 1) 5-minute manager wait timeout (both Guest TEMPORARY and Customer PERSISTENT)

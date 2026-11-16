@@ -6,6 +6,8 @@ const { sendPasswordResetEmail } = require("./mail_service");
 const { revokeUserAccess } = require("./chat/identity");
 const { triggerOutboxDrain } = require("./chat/runtime");
 
+const EMAIL_REGEX = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
+
 /**
  * Lấy danh sách tài khoản quản trị (ADMIN và ACCOMMODATION_MANAGER)
  */
@@ -254,23 +256,25 @@ async function updateAdminUser(targetUserId, { fullName, personalEmail, phoneNum
     if (personalEmail !== undefined && personalEmail !== null) {
         const trimmedEmail = String(personalEmail).trim().toLowerCase();
         if (trimmedEmail) {
-            if (!trimmedEmail.includes("@")) {
-                throw { statusCode: 400, errorCode: "INVALID_EMAIL", message: "Địa chỉ Gmail cá nhân không hợp lệ." };
+            if (trimmedEmail.length > 255 || !EMAIL_REGEX.test(trimmedEmail)) {
+                throw { statusCode: 400, errorCode: "INVALID_EMAIL", message: "Địa chỉ Email cá nhân không hợp lệ." };
             }
             const dupCheck = await pool
                 .request()
                 .input("id", sql.UniqueIdentifier, targetUserId)
                 .input("personalEmail", sql.VarChar(255), trimmedEmail)
-                .query("SELECT TOP 1 id, full_name FROM dbo.users WHERE id <> @id AND (personal_email = @personalEmail OR email = @personalEmail);");
+                .query("SELECT TOP 1 id, full_name FROM dbo.users WHERE id <> @id AND (LOWER(LTRIM(RTRIM(personal_email))) = @personalEmail OR LOWER(LTRIM(RTRIM(email))) = @personalEmail);");
 
             if (dupCheck.recordset.length > 0) {
                 throw {
                     statusCode: 409,
                     errorCode: "EMAIL_ALREADY_EXISTS",
-                    message: `Địa chỉ Gmail "${trimmedEmail}" đã thuộc về "${dupCheck.recordset[0].full_name}".`,
+                    message: `Địa chỉ email "${trimmedEmail}" đã thuộc về "${dupCheck.recordset[0].full_name}".`,
                 };
             }
             cleanPersonalEmail = trimmedEmail;
+        } else if (targetUser.role === "ADMIN") {
+            cleanPersonalEmail = null;
         }
     }
 

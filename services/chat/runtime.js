@@ -18,19 +18,68 @@ let cleanupTimer = null;
 let revalidateTimer = null;
 let activeDrainPromise = null;
 let drainQueuedAgain = false;
+const activeAiJobs = new Map();
 
 function actorRoom(actorKey) {
   return `actor:${actorKey}`;
+}
+
+async function freshSocketActor(socket) {
+  const actor = await revalidateSocketActor(socket.data);
+  if (!actor) {
+    socket.emit("access:revoked", { reason: "SESSION_EXPIRED" });
+    socket.disconnect(true);
+    return null;
+  }
+  socket.data.actor = actor;
+  return actor;
+}
+
+async function leaveConversationRooms(socket, cid) {
+  await Promise.all(["public", "owner", "staff"].map((kind) => socket.leave(`conversation:${cid}:${kind}`)));
+}
+
+async function authorizeConversationSocket(socket, cid, visibility = "PUBLIC", sequence = null) {
+  const actor = await freshSocketActor(socket);
+  if (!actor) return false;
+  try {
+    if (socket.data.audience === "web") {
+      if (visibility === "STAFF") return false;
+      await chatService.assertOwnerConversation(actor, cid);
+    } else {
+      if (visibility === "OWNER_ONLY") return false;
+      const conv = await adminService.assertStaffConversationAccess(actor, cid);
+      if (actor.role === "ACCOMMODATION_MANAGER" && sequence != null &&
+          Number(sequence) < Number(conv.visibleFromSequence || 0)) return false;
+    }
+    return true;
+  } catch (err) {
+    if (![400, 401, 403, 404, 409].includes(err?.statusCode)) throw err;
+    await leaveConversationRooms(socket, cid);
+    return false;
+  }
+}
+
+async function emitConversationEvent(nsp, cid, eventName, payload, visibility, rooms, excludeSocketId = null) {
+  // Rooms are subscriptions, not authorization. A unified thread can move to
+  // another property while the former manager keeps the same socket open.
+  const candidates = await nsp.in(rooms).fetchSockets();
+  const checks = await Promise.all(candidates.map(async (socket) => {
+    if (socket.id === excludeSocketId) return null;
+    return await authorizeConversationSocket(socket, cid, visibility, payload.message?.sequence) ? socket.id : null;
+  }));
+  const ids = checks.filter(Boolean);
+  if (ids.length) nsp.to(ids).emit(eventName, payload);
 }
 
 function getRuntime() {
   if (!ioInstance) return null;
   const nsp = ioInstance.of("/chat");
 
-  function emitToConversation(conversationId, eventName, payload) {
+  async function emitToConversation(conversationId, eventName, payload) {
     const cid = Number(conversationId);
     // AI may stream private booking data before the final message visibility is known.
-    nsp.to(`conversation:${cid}:owner`).emit(eventName, payload);
+    await emitConversationEvent(nsp, cid, eventName, payload, "OWNER_ONLY", [`conversation:${cid}:owner`]);
   }
 
   return {
@@ -43,17 +92,12 @@ function getRuntime() {
 
 async function dispatchOutboxJob(job) {
   const runtime = getRuntime();
-  if (!runtime) return;
+  if (!runtime) throw new Error("Chat runtime is not ready.");
   const { nsp } = runtime;
   const payload = parseJsonSafe(job.payloadJson, {}) || {};
 
   if (job.kind === "AI_SCHEDULE") {
-    // Execute async without stalling other outbox deliveries
-    setImmediate(() => {
-      aiService.executeAiJob(payload.conversationId || job.conversationId, runtime).catch((err) => {
-        console.error("[chat.outbox.AI_SCHEDULE]", err);
-      });
-    });
+    await aiService.executeAiJob(payload.conversationId || job.conversationId, runtime, { outboxJobId: Number(job.id) });
     return;
   }
 
@@ -121,33 +165,73 @@ async function dispatchOutboxJob(job) {
       : payload.visibility || payload.message?.visibility || "PUBLIC";
 
     if (visibility === "OWNER_ONLY") {
-      let recipients = nsp.to(`conversation:${cid}:owner`);
-      if (payload.ownerKey) recipients = recipients.to(actorRoom(payload.ownerKey));
-      recipients.emit(job.eventName, payload);
+      const rooms = [`conversation:${cid}:owner`];
+      if (payload.ownerKey) rooms.push(actorRoom(payload.ownerKey));
+      await emitConversationEvent(nsp, cid, job.eventName, payload, visibility, rooms);
       return;
     }
 
     if (visibility === "STAFF") {
-      nsp.to(`conversation:${cid}:staff`).emit(job.eventName, payload);
+      await emitConversationEvent(nsp, cid, job.eventName, payload, visibility, [`conversation:${cid}:staff`]);
       return;
     }
 
     // PUBLIC events: deliver to joined conversation room + owner room + target/assigned manager room + admin supervisors
     // A socket can belong to several of these rooms. Emit once to their union.
-    let recipients = nsp.to(`conversation:${cid}:public`);
+    const rooms = [`conversation:${cid}:public`];
     if (payload.ownerKey) {
-      recipients = recipients.to(actorRoom(payload.ownerKey));
+      rooms.push(actorRoom(payload.ownerKey));
     }
     if (payload.assignedUserId) {
-      recipients = recipients.to(actorRoom(`user:${String(payload.assignedUserId).toLowerCase()}`));
+      rooms.push(actorRoom(`user:${String(payload.assignedUserId).toLowerCase()}`));
     }
     if (payload.targetManagerUserId) {
-      recipients = recipients.to(actorRoom(`user:${String(payload.targetManagerUserId).toLowerCase()}`));
+      rooms.push(actorRoom(`user:${String(payload.targetManagerUserId).toLowerCase()}`));
     }
     if (["message:created", "conversation:updated"].includes(job.eventName)) {
-      recipients = recipients.to("role:ADMIN");
+      rooms.push("role:ADMIN");
     }
-    recipients.emit(job.eventName, payload);
+    await emitConversationEvent(nsp, cid, job.eventName, payload, visibility, rooms);
+  }
+}
+
+const AI_LEASE_SECONDS = Math.max(120, Math.ceil((config.aiTimeoutMs || 35000) / 1000) + 60);
+
+async function processOutboxJob(job) {
+  const pool = getDBPool();
+  const heartbeat = job.kind === "AI_SCHEDULE" ? setInterval(() => {
+    pool.request()
+      .input("id", sqlObj.BigInt, job.id)
+      .input("workerId", sqlObj.VarChar(100), WORKER_ID)
+      .input("leaseSeconds", sqlObj.Int, AI_LEASE_SECONDS)
+      .query(`UPDATE dbo.chat_outbox SET locked_until = DATEADD(second, @leaseSeconds, SYSUTCDATETIME())
+              WHERE id = @id AND status = 'PENDING' AND locked_by = @workerId;`)
+      .catch((err) => console.error("[chat.outbox.lease]", err));
+  }, Math.floor(AI_LEASE_SECONDS * 1000 / 3)) : null;
+  try {
+    await dispatchOutboxJob(job);
+    await pool.request()
+      .input("id", sqlObj.BigInt, job.id)
+      .input("workerId", sqlObj.VarChar(100), WORKER_ID)
+      .query(`UPDATE dbo.chat_outbox
+              SET status = 'SENT', processed_at = SYSUTCDATETIME(), locked_until = NULL, locked_by = NULL
+              WHERE id = @id AND status = 'PENDING' AND locked_by = @workerId;`);
+  } catch (err) {
+    const attempts = Number(job.attempts || 0) + 1;
+    await pool.request()
+      .input("id", sqlObj.BigInt, job.id)
+      .input("workerId", sqlObj.VarChar(100), WORKER_ID)
+      .input("status", sqlObj.VarChar(16), attempts >= 5 ? "DEAD" : "PENDING")
+      .input("attempts", sqlObj.Int, attempts)
+      .input("err", sqlObj.NVarChar(500), String(err?.message || "DISPATCH_ERR").slice(0, 480))
+      .query(`UPDATE dbo.chat_outbox
+              SET status = @status, attempts = @attempts, last_error = @err,
+                  available_at = DATEADD(second, CASE WHEN @attempts = 1 THEN 2 ELSE 10 END, SYSUTCDATETIME()),
+                  processed_at = CASE WHEN @status = 'DEAD' THEN SYSUTCDATETIME() ELSE NULL END,
+                  locked_until = NULL, locked_by = NULL
+              WHERE id = @id AND status = 'PENDING' AND locked_by = @workerId;`);
+  } finally {
+    if (heartbeat) clearInterval(heartbeat);
   }
 }
 
@@ -156,6 +240,7 @@ async function runDrainPass() {
   const res = await pool
     .request()
     .input("workerId", sqlObj.VarChar(100), WORKER_ID)
+    .input("aiLeaseSeconds", sqlObj.Int, AI_LEASE_SECONDS)
     .query(`
       SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
       ;WITH cte AS (
@@ -167,7 +252,7 @@ async function runDrainPass() {
         ORDER BY available_at ASC, id ASC
       )
       UPDATE cte
-      SET locked_until = DATEADD(second, 15, SYSUTCDATETIME()),
+      SET locked_until = DATEADD(second, CASE WHEN kind = 'AI_SCHEDULE' THEN @aiLeaseSeconds ELSE 15 END, SYSUTCDATETIME()),
           locked_by = @workerId
       OUTPUT
         INSERTED.id,
@@ -179,36 +264,14 @@ async function runDrainPass() {
     `);
 
   for (const job of res.recordset) {
-    try {
-      await dispatchOutboxJob(job);
-      await pool
-        .request()
-        .input("id", sqlObj.BigInt, job.id)
-        .query(`
-          UPDATE dbo.chat_outbox
-          SET status = 'SENT', processed_at = SYSUTCDATETIME(), locked_until = NULL, locked_by = NULL
-          WHERE id = @id;
-        `);
-    } catch (err) {
-      const nextAttempt = Number(job.attempts || 0) + 1;
-      const nextStatus = nextAttempt >= 5 ? "DEAD" : "PENDING";
-      await pool
-        .request()
-        .input("id", sqlObj.BigInt, job.id)
-        .input("status", sqlObj.VarChar(16), nextStatus)
-        .input("attempts", sqlObj.Int, nextAttempt)
-        .input("err", sqlObj.NVarChar(500), String(err?.message || "DISPATCH_ERR").slice(0, 480))
-        .query(`
-          UPDATE dbo.chat_outbox
-          SET status = @status,
-              attempts = @attempts,
-              last_error = @err,
-              available_at = DATEADD(second, CASE WHEN @attempts = 1 THEN 2 ELSE 10 END, SYSUTCDATETIME()),
-              processed_at = CASE WHEN @status = 'DEAD' THEN SYSUTCDATETIME() ELSE NULL END,
-              locked_until = NULL,
-              locked_by = NULL
-          WHERE id = @id;
-        `);
+    if (job.kind === "AI_SCHEDULE") {
+      if (activeAiJobs.has(Number(job.id))) continue;
+      const work = processOutboxJob(job)
+        .catch((err) => console.error("[chat.outbox.AI_SCHEDULE]", err))
+        .finally(() => activeAiJobs.delete(Number(job.id)));
+      activeAiJobs.set(Number(job.id), work);
+    } else {
+      await processOutboxJob(job);
     }
   }
 }
@@ -291,10 +354,6 @@ function attachChatSocket(httpServer) {
         socket.data.actor = freshActor;
         const cid = Number(data.conversationId);
         if (socket.data.audience === "web") {
-          await chatService.assertOwnerConversation?.(freshActor, cid).catch(async () => {
-            await chatService.getOwnerConversationDetail(freshActor, cid);
-          });
-          // Re-verify strictly using getOwnerConversationDetail
           const detail = await chatService.getOwnerConversationDetail(freshActor, cid);
           socket.join(`conversation:${cid}:public`);
           socket.join(`conversation:${cid}:owner`);
@@ -360,7 +419,8 @@ function attachChatSocket(httpServer) {
 
     socket.on("message:delivered", async (data = {}, ack) => {
       try {
-        const actorNow = socket.data.actor;
+        const actorNow = await freshSocketActor(socket);
+        if (!actorNow) return ack?.({ ok: false, errorCode: "SESSION_EXPIRED" });
         let out = null;
         if (socket.data.audience === "web") {
           out = await chatService.updateOwnerReceipt(actorNow, data.conversationId, data.sequence, { kind: "delivered" });
@@ -376,7 +436,8 @@ function attachChatSocket(httpServer) {
 
     socket.on("message:read", async (data = {}, ack) => {
       try {
-        const actorNow = socket.data.actor;
+        const actorNow = await freshSocketActor(socket);
+        if (!actorNow) return ack?.({ ok: false, errorCode: "SESSION_EXPIRED" });
         let out = null;
         if (socket.data.audience === "web") {
           out = await chatService.updateOwnerReceipt(actorNow, data.conversationId, data.sequence, { kind: "read" });
@@ -390,15 +451,22 @@ function attachChatSocket(httpServer) {
       }
     });
 
-    socket.on("typing:update", (data = {}) => {
-      const cid = Number(data.conversationId);
-      if (!cid || actor.role === "ADMIN") return;
-      socket.to(`conversation:${cid}:public`).emit("typing:update", {
-        conversationId: cid,
-        actorKey: actor.actorKey,
-        actorName: actor.displayName,
-        isTyping: Boolean(data.isTyping),
-      });
+    socket.on("typing:update", async (data = {}, ack) => {
+      try {
+        const cid = Number(data.conversationId);
+        if (!Number.isSafeInteger(cid) || cid < 1 || socket.data.actor?.role === "ADMIN") return ack?.({ ok: false });
+        if (!(await authorizeConversationSocket(socket, cid))) return ack?.({ ok: false, errorCode: "FORBIDDEN" });
+        const actorNow = socket.data.actor;
+        await emitConversationEvent(nsp, cid, "typing:update", {
+          conversationId: cid,
+          actorKey: actorNow.actorKey,
+          actorName: actorNow.displayName,
+          isTyping: Boolean(data.isTyping),
+        }, "PUBLIC", [`conversation:${cid}:public`], socket.id);
+        return ack?.({ ok: true });
+      } catch {
+        return ack?.({ ok: false, errorCode: "FORBIDDEN" });
+      }
     });
 
     socket.on("presence:heartbeat", () => {
@@ -438,7 +506,9 @@ function attachChatSocket(httpServer) {
     socket.on("internal:delivered", async (data = {}, ack) => {
       try {
         if (socket.data.audience !== "admin") return ack?.({ ok: false });
-        const out = await internalService.updateInternalReceipt(socket.data.actor, data.threadId, data.sequence, {
+        const actorNow = await freshSocketActor(socket);
+        if (!actorNow) return ack?.({ ok: false, errorCode: "SESSION_EXPIRED" });
+        const out = await internalService.updateInternalReceipt(actorNow, data.threadId, data.sequence, {
           kind: "delivered",
         });
         setImmediate(() => drainOutboxOnce().catch(() => {}));
@@ -451,7 +521,9 @@ function attachChatSocket(httpServer) {
     socket.on("internal:read", async (data = {}, ack) => {
       try {
         if (socket.data.audience !== "admin") return ack?.({ ok: false });
-        const out = await internalService.updateInternalReceipt(socket.data.actor, data.threadId, data.sequence, {
+        const actorNow = await freshSocketActor(socket);
+        if (!actorNow) return ack?.({ ok: false, errorCode: "SESSION_EXPIRED" });
+        const out = await internalService.updateInternalReceipt(actorNow, data.threadId, data.sequence, {
           kind: "read",
         });
         setImmediate(() => drainOutboxOnce().catch(() => {}));
@@ -504,6 +576,11 @@ function startWorkers() {
             s.disconnect(true);
           } else {
             s.data.actor = ok;
+            const conversationIds = new Set([...s.rooms].flatMap((room) => {
+              const match = /^conversation:(\d+):/.exec(room);
+              return match ? [Number(match[1])] : [];
+            }));
+            for (const cid of conversationIds) await authorizeConversationSocket(s, cid);
           }
         }
       } catch (err) {

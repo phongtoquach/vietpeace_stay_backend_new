@@ -158,7 +158,7 @@ async function isAiTurnStillValid(conversationId, expectedRevision, expectedRunI
  * Executed by outbox/AI scheduler when `ai_due_at <= now`.
  * Respects trailing-edge debounce: if `ai_due_at > now`, reschedules instead of running prematurely.
  */
-async function executeAiJob(conversationId, runtime) {
+async function executeAiJob(conversationId, runtime, { outboxJobId = null } = {}) {
   const pool = getDBPool();
   const cid = Number(conversationId);
 
@@ -195,6 +195,20 @@ async function executeAiJob(conversationId, runtime) {
     const conv = res.recordset[0];
     if (!conv) return { action: "SKIP" };
     if (conv.status !== "OPEN" || conv.handlingMode !== "AI") return { action: "SKIP" };
+    if (!conv.aiDueAt && outboxJobId) {
+      // The lease can be reclaimed after a process stops mid-answer. Resume
+      // only the run owned by this durable job, never a newer user turn.
+      const interrupted = await newRequest(tx)
+        .input("cid", sqlObj.BigInt, cid)
+        .input("jobId", sqlObj.BigInt, outboxJobId)
+        .query(`SELECT r.id FROM dbo.chat_ai_runs AS r
+                INNER JOIN dbo.chat_outbox AS o
+                  ON r.id = TRY_CAST(JSON_VALUE(o.payload_json, '$.aiRunId') AS BIGINT)
+                INNER JOIN dbo.chat_conversations AS c ON c.id = r.conversation_id
+                WHERE o.id = @jobId AND r.conversation_id = @cid AND r.status = 'RUNNING'
+                  AND r.control_revision = c.control_revision;`);
+      if (interrupted.recordset.length) conv.aiDueAt = new Date();
+    }
     if (!conv.aiDueAt) return { action: "SKIP" };
     if (!config.aiEnabled()) return { action: "DISABLED", conv };
 
@@ -239,13 +253,20 @@ async function executeAiJob(conversationId, runtime) {
       `);
 
     const runId = Number(runRes.recordset[0].id);
+    if (outboxJobId) {
+      await newRequest(tx)
+        .input("jobId", sqlObj.BigInt, outboxJobId)
+        .input("runId", sqlObj.BigInt, runId)
+        .query(`UPDATE dbo.chat_outbox SET payload_json = JSON_MODIFY(payload_json, '$.aiRunId', @runId)
+                WHERE id = @jobId;`);
+    }
     return { action: "RUN", conv, runId };
   });
 
   if (!claimed || claimed.action === "SKIP" || claimed.action === "DEFERRED") return;
 
   if (claimed.action === "DISABLED") {
-    runtime?.emitToConversation(cid, "ai:failed", {
+    await runtime?.emitToConversation(cid, "ai:failed", {
       conversationId: cid,
       errorCode: "AI_DISABLED",
       message: "Trợ lý AI hiện đang tạm tắt bởi quản trị viên.",
@@ -297,7 +318,7 @@ async function executeAiJob(conversationId, runtime) {
     if (!flushTimer) {
       flushTimer = setTimeout(() => {
         flushTimer = null;
-        flushDeltas(false);
+        flushDeltas(false).catch((err) => console.error("[chat.ai.delta]", cid, err));
       }, 80);
     }
   }
@@ -310,7 +331,7 @@ async function executeAiJob(conversationId, runtime) {
     if (!deltaBuffer) return;
     const chunk = deltaBuffer;
     deltaBuffer = "";
-    runtime?.emitToConversation(cid, "ai:delta", { conversationId: cid, runId, delta: chunk });
+    await runtime?.emitToConversation(cid, "ai:delta", { conversationId: cid, runId, delta: chunk });
   }
 
   try {
@@ -330,7 +351,7 @@ async function executeAiJob(conversationId, runtime) {
         .request()
         .input("runId", sqlObj.BigInt, runId)
         .query(`UPDATE dbo.chat_ai_runs SET status = 'CANCELLED', completed_at = SYSUTCDATETIME() WHERE id = @runId;`);
-      runtime?.emitToConversation(cid, "ai:failed", {
+      await runtime?.emitToConversation(cid, "ai:failed", {
         conversationId: cid,
         runId,
         errorCode: "AI_DISABLED_FOR_PROPERTY",
@@ -363,6 +384,8 @@ async function executeAiJob(conversationId, runtime) {
     for (const m of chronological) {
       if (m.senderType === "GUEST" || m.senderType === "CUSTOMER") {
         contents.push({ role: "user", parts: [{ text: m.content }] });
+      } else if (m.senderType === "MANAGER") {
+        contents.push({ role: "model", parts: [{ text: `[Quản lý cơ sở đã tư vấn] ${m.content}` }] });
       } else if (m.senderType === "AI") {
         contents.push({ role: "model", parts: [{ text: m.content }] });
       } else if (m.senderType === "SYSTEM" && m.messageType === "PROPERTY_CARD") {
@@ -401,7 +424,7 @@ async function executeAiJob(conversationId, runtime) {
       hasCitySearch: false,
     };
 
-    runtime?.emitToConversation(cid, "ai:started", { conversationId: cid, runId });
+    await runtime?.emitToConversation(cid, "ai:started", { conversationId: cid, runId });
 
     let finalAnswerText = "";
     let lastUsage = null;
@@ -414,7 +437,7 @@ async function executeAiJob(conversationId, runtime) {
       const valid = await isAiTurnStillValid(cid, conv.controlRevision, runId);
       if (!valid) {
         await abortController.abort();
-        runtime?.emitToConversation(cid, "ai:cancelled", { conversationId: cid, runId });
+        await runtime?.emitToConversation(cid, "ai:cancelled", { conversationId: cid, runId });
         return;
       }
 
@@ -664,7 +687,7 @@ async function executeAiJob(conversationId, runtime) {
     });
 
     if (saved?.cancelled) {
-      runtime?.emitToConversation(cid, "ai:cancelled", { conversationId: cid, runId });
+      await runtime?.emitToConversation(cid, "ai:cancelled", { conversationId: cid, runId });
     } else {
       runtime?.triggerOutboxDrain?.();
     }
@@ -686,11 +709,11 @@ async function executeAiJob(conversationId, runtime) {
       `);
 
     if (cancelled || !failedRun.recordset.length) {
-      runtime?.emitToConversation(cid, "ai:cancelled", { conversationId: cid, runId });
+      await runtime?.emitToConversation(cid, "ai:cancelled", { conversationId: cid, runId });
       return;
     }
     // NO auto-escalation to Manager on AI failure! Keep mode = 'AI' cleanly.
-    runtime?.emitToConversation(cid, "ai:failed", {
+    await runtime?.emitToConversation(cid, "ai:failed", {
       conversationId: cid,
       runId,
       errorCode: err?.errorCode || "AI_FAILED",

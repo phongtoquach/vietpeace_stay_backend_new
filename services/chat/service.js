@@ -1696,7 +1696,7 @@ async function sendOwnerMessage(actor, conversationId, { content, clientMessageI
  * Customer/Guest explicitly requests connection to the accommodation's Manager (5-minute timeout).
  * Rejects auto-escalation from PLATFORM without picking accommodation first.
  */
-async function requestHumanSupport(actor, conversationId, { reason = null } = {}) {
+async function requestHumanSupport(actor, conversationId, { reason = null, accommodationId = null } = {}) {
   const cid = Number(conversationId);
   const result = await withTransaction(async (tx) => {
     await lockConversationsInOrder(tx, [cid]);
@@ -1711,6 +1711,9 @@ async function requestHumanSupport(actor, conversationId, { reason = null } = {}
         "PROPERTY_SELECTION_REQUIRED",
         "Vui lòng chọn Điểm đến và Cơ sở lưu trú bạn muốn liên hệ trước khi kết nối với Quản lý.",
       );
+    }
+    if (accommodationId !== null && Number(accommodationId) !== Number(row.accommodationId)) {
+      throw chatError(409, "PROPERTY_CONTEXT_CHANGED", "Cơ sở tư vấn đã thay đổi. Vui lòng chọn lại cơ sở muốn gặp Quản lý.");
     }
     if (row.handlingMode === "HUMAN" || row.handlingMode === "WAITING_HUMAN") {
       return {
@@ -2676,6 +2679,7 @@ module.exports = {
   POLITE_HOME_GREETING,
   getFeaturedDestinations,
   resolveVerifiedPageContext,
+  assertOwnerConversation,
   listOwnerConversations,
   getOwnerConversationDetail,
   getOwnerConversationMessages,
