@@ -1,4 +1,5 @@
 const { getDBPool } = require("../configs/database");
+const { activeManagerAssignedSql } = require("./accommodation_manager_guard");
 
 const activeLocationsCte = `
     ;WITH ActiveLocations AS (
@@ -35,6 +36,7 @@ async function getAllLocationsAndAccommodations() {
             WHERE a.location_id = l.id
                 AND a.status = 1
                 AND a.deleted_at IS NULL
+                AND ${activeManagerAssignedSql("a")}
         )
         ORDER BY l.id ASC
         OPTION (MAXRECURSION 0);
@@ -48,7 +50,7 @@ async function getAllLocationsAndAccommodations() {
             a.accommodation_name
         FROM dbo.accommodations AS a
         INNER JOIN ActiveLocations AS active ON active.id = a.location_id
-        WHERE a.status = 1 AND a.deleted_at IS NULL
+        WHERE a.status = 1 AND a.deleted_at IS NULL AND ${activeManagerAssignedSql("a")}
         ORDER BY a.id ASC
         OPTION (MAXRECURSION 0);
     `);

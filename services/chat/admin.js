@@ -16,6 +16,7 @@ const { hasPermission } = require("./identity");
 const { appendSystemMessage } = require("./lifecycle");
 const provider = require("./provider");
 const { reportInteger, reportPagination } = require("./report_validation");
+const { getConversationRatingState } = require("./rating_state");
 
 function assertManagerAccess(actor) {
   if (!actor || actor.role !== "ACCOMMODATION_MANAGER") {
@@ -835,7 +836,6 @@ async function sendManagerReply(actor, conversationId, { content, clientMessageI
       },
     });
 
-    const firstReplyIso = new Date().toISOString();
     await enqueueOutbox(tx, {
       kind: "SOCKET_EVENT",
       conversationId: cid,
@@ -847,9 +847,7 @@ async function sendManagerReply(actor, conversationId, { content, clientMessageI
         assignedUserId: actor.userId,
         assignedManagerName: actor.displayName,
         managerWaitExpiresAt: null,
-        handoffFirstHumanReplyAt: firstReplyIso,
-        pendingRatingHandoffId: conv.currentHandoffId ? Number(conv.currentHandoffId) : null,
-        pendingRatingManagerName: actor.displayName,
+        ...await getConversationRatingState(tx, cid),
       },
     });
 
@@ -967,27 +965,14 @@ async function returnConversationToAi(actor, conversationId) {
       throw chatError(409, "INVALID_STATE", "Chỉ có thể trả về AI khi Quản lý đang tiếp nhận.");
     }
 
-    let pendingRatingHandoffId = null;
     if (conv.currentHandoffId) {
-      const hCheck = await newRequest(tx)
+      await newRequest(tx)
         .input("hid", sqlObj.BigInt, conv.currentHandoffId)
         .query(`
-          SELECT TOP 1
-            h.id,
-            h.first_human_reply_at AS firstHumanReplyAt,
-            CASE WHEN r.id IS NOT NULL THEN 1 ELSE 0 END AS alreadyRated
-          FROM dbo.chat_handoff_sessions AS h
-          LEFT JOIN dbo.chat_conversation_ratings AS r ON r.handoff_id = h.id
-          WHERE h.id = @hid;
-
           UPDATE dbo.chat_handoff_sessions
           SET status = 'RESOLVED', ended_at = SYSUTCDATETIME(), ended_reason = 'RETURNED_TO_AI'
           WHERE id = @hid AND status = 'CLAIMED';
         `);
-      const hr = hCheck.recordset?.[0];
-      if (hr?.firstHumanReplyAt && !hr.alreadyRated) {
-        pendingRatingHandoffId = Number(hr.id);
-      }
     }
 
     await newRequest(tx)
@@ -1032,12 +1017,7 @@ async function returnConversationToAi(actor, conversationId) {
         assignedUserId: null,
         currentHandoffId: null,
         managerWaitExpiresAt: null,
-        ...(pendingRatingHandoffId
-          ? {
-              pendingRatingHandoffId,
-              pendingRatingManagerName: actor.displayName,
-            }
-          : {}),
+        ...await getConversationRatingState(tx, cid),
       },
     });
 
@@ -1071,27 +1051,14 @@ async function resolveConversationByManager(actor, conversationId) {
     const conv = await assertStaffConversationAccess(actor, cid, tx);
     if (conv.status === "RESOLVED") return;
 
-    let pendingRatingHandoffId = null;
     if (conv.currentHandoffId) {
-      const hCheck = await newRequest(tx)
+      await newRequest(tx)
         .input("hid", sqlObj.BigInt, conv.currentHandoffId)
         .query(`
-          SELECT TOP 1
-            h.id,
-            h.first_human_reply_at AS firstHumanReplyAt,
-            CASE WHEN r.id IS NOT NULL THEN 1 ELSE 0 END AS alreadyRated
-          FROM dbo.chat_handoff_sessions AS h
-          LEFT JOIN dbo.chat_conversation_ratings AS r ON r.handoff_id = h.id
-          WHERE h.id = @hid;
-
           UPDATE dbo.chat_handoff_sessions
           SET status = 'RESOLVED', ended_at = SYSUTCDATETIME(), ended_reason = 'MANAGER_RESOLVED'
           WHERE id = @hid AND status IN ('PENDING', 'CLAIMED');
         `);
-      const hr = hCheck.recordset?.[0];
-      if (hr?.firstHumanReplyAt && !hr.alreadyRated) {
-        pendingRatingHandoffId = Number(hr.id);
-      }
     }
 
     await newRequest(tx)
@@ -1134,12 +1101,7 @@ async function resolveConversationByManager(actor, conversationId) {
         ownerKey,
         status: "RESOLVED",
         managerWaitExpiresAt: null,
-        ...(pendingRatingHandoffId
-          ? {
-              pendingRatingHandoffId,
-              pendingRatingManagerName: actor.displayName,
-            }
-          : {}),
+        ...await getConversationRatingState(tx, cid),
       },
     });
   });

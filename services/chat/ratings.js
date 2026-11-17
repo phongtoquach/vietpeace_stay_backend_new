@@ -10,6 +10,7 @@ const {
 } = require("./db");
 const { hasPermission } = require("./identity");
 const { reportInteger, reportPagination, reportText } = require("./report_validation");
+const { getConversationRatingState } = require("./rating_state");
 
 /**
  * Customer rates a specific handoff session 1-5 stars after at least one public manager reply.
@@ -127,9 +128,8 @@ async function submitHandoffRating(actor, handoffId, { rating, comment = null })
       payload: {
         conversationId: Number(h.conversationId),
         ownerKey: actor.actorKey,
-        hasRatedHandoff: true,
-        pendingRatingHandoffId: null,
-        pendingRatingManagerName: null,
+        ratedHandoffId: hid,
+        ...await getConversationRatingState(tx, Number(h.conversationId)),
       },
     });
 

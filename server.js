@@ -19,6 +19,7 @@ const { createWebChatRouter, createAdminChatRouter } = require("./routes/chat_ro
 const { attachChatSocket, stopWorkers } = require("./services/chat/runtime");
 const { ensureCustomerAuthSchema } = require("./services/customer_auth_schema");
 const { ensureCompensationNegotiationSchema } = require("./services/compensation_negotiation_schema");
+const { syncUnmanagedAccommodationsToInactive } = require("./services/accommodation_manager_guard");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -58,6 +59,7 @@ async function startServer({ port = PORT } = {}) {
     const pool = await connectDB();
     await ensureCustomerAuthSchema(pool);
     await ensureCompensationNegotiationSchema(pool);
+    await syncUnmanagedAccommodationsToInactive(pool);
 
     const httpServer = http.createServer(app);
     attachChatSocket(httpServer);

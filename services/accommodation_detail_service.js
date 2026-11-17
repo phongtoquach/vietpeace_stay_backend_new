@@ -1,4 +1,5 @@
 const { sqlObj, getDBPool } = require("../configs/database");
+const { activeManagerAssignedSql } = require("./accommodation_manager_guard");
 
 async function getAccommodationDetailById(accommodationId) {
     console.log("[getAccommodationDetailById service] chuan bi chạy query lấy accommodation data cho accommodationId : " + accommodationId);
@@ -48,7 +49,8 @@ async function getAccommodationDetailById(accommodationId) {
             LEFT JOIN dbo.wards AS w ON w.id = a.ward_id
             WHERE a.id = @accommodationId
               AND a.status = 1
-              AND a.deleted_at IS NULL;
+              AND a.deleted_at IS NULL
+              AND ${activeManagerAssignedSql("a")};
 
             SELECT
                 i.id AS image_id,

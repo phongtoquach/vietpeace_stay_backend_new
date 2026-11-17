@@ -58,6 +58,73 @@ function mergeDiscussedContext(prevCtx, runContext) {
   };
 }
 
+// These targets come from successful database tools, never from generated prose.
+function mergeNavigationLinks(previous, incoming) {
+  const byUrl = new Map();
+  for (const link of [...previous, ...incoming]) {
+    if (typeof link?.url !== 'string') continue;
+    byUrl.delete(link.url);
+    byUrl.set(link.url, link);
+  }
+  return [...byUrl.values()].slice(-100);
+}
+
+function collectNavigationLinks(result = {}) {
+  const links = [];
+  const add = (url, label, kind, extra = {}) => {
+    if (url && !links.some((link) => link.url === url)) links.push({ url, label, kind, ...extra });
+  };
+  const positiveId = (value) => Number.isSafeInteger(Number(value)) && Number(value) > 0;
+  function property(property) {
+    const id = property?.accommodationId || property?.id;
+    if (!positiveId(id)) return;
+    const name = property.accommodationName || property.name || `#${id}`;
+    add(`/accommodation-detail?accommodationId=${Number(id)}`, `Xem cơ sở ${name}`, "PROPERTY");
+    const contact = property.contact || property.accommodationContact || property;
+    if (typeof contact.websiteUrl === "string" && contact.websiteUrl.trim()) {
+      try {
+        const raw = contact.websiteUrl.trim();
+        if (/^[a-z][a-z\d+.-]*:/i.test(raw) && !/^https?:\/\//i.test(raw)) throw new Error('Invalid website scheme');
+        const url = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw.replace(/^\/\//, "")}`);
+        if (["http:", "https:"].includes(url.protocol) && !url.username && !url.password) {
+          add(url.href, `Website ${name}`, "WEBSITE");
+        }
+      } catch { /* No actionable link for an invalid stored website. */ }
+    }
+    if (typeof contact.email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contact.email.trim())) {
+      add(`mailto:${contact.email.trim()}`, contact.email.trim(), "EMAIL");
+    }
+    for (const label of String(contact.phone || "").split(/\s+-\s+|[;,|/]/)) {
+      const number = label.replace(/[\s().-]/g, "");
+      if (/^\+?\d{7,16}$/.test(number)) add(`tel:${number}`, label.trim(), "PHONE");
+    }
+  }
+  property(result.accommodation);
+  for (const item of result.items || []) property(item);
+  for (const booking of [result.booking, ...(result.bookings || [])].filter(Boolean)) {
+    const id = String(booking.id || "");
+    if (/^[1-9]\d{0,18}$/.test(id) && BigInt(id) <= 9223372036854775807n) {
+      add(`/my-account/my-bookings/booking/${id}`, `Xem đơn #${booking.bookingCode || id}`, "BOOKING", { bookingCode: booking.bookingCode });
+      if (booking.checkoutInvoice?.canViewInvoice) add(`/my-account/my-bookings/booking/${id}#checkout-folio`,
+        `Xem hóa đơn #${booking.bookingCode || id}`, "INVOICE", { bookingCode: booking.bookingCode });
+      if (booking.status === "PENDING_PAYMENT") add(`/checkout?bookingId=${id}`, `Thanh toán đơn #${booking.bookingCode || id}`, "CHECKOUT");
+    }
+    property({ ...booking, id: booking.accommodationId, contact: booking.accommodationContact });
+  }
+  if (result.status === "READY") {
+    for (const option of result.options || []) {
+      const rooms = option.quote?.selectedRooms;
+      if (!positiveId(result.accommodation?.id) || !rooms?.length || !result.checkinDate || !result.checkoutDate) continue;
+      const quoteDraft = { accommodationId: Number(result.accommodation.id), checkinDate: result.checkinDate,
+        checkoutDate: result.checkoutDate, selectedRooms: rooms.map(({ roomTypeId, adults, children }) => ({ roomTypeId, adults, children })) };
+      const url = option.bookingUrl || `/accommodation-detail?accommodationId=${quoteDraft.accommodationId}&checkin=${result.checkinDate}&checkout=${result.checkoutDate}&rooms=${rooms.length}`;
+      add(url, `${option.label || "Xem phòng và đặt ngay"} · ${result.accommodation.accommodationName}`, "ROOM_QUOTE", { quoteDraft });
+    }
+  }
+  if (positiveId(result.locationId)) add(`/search-accommodations?locationId=${Number(result.locationId)}`, `Xem cơ sở tại ${result.locationName || `#${result.locationId}`}`, "LOCATION");
+  return links;
+}
+
 function buildSystemPrompt({ conv, pageContext, actor, today }) {
   const ctxLines = [];
   if (pageContext?.pageType === "ACCOMMODATION_DETAIL" && pageContext.accommodationId) {
@@ -108,6 +175,7 @@ NGUYÊN TẮC CỐT LÕI (BẮT BUỘC TUÂN THỦ):
 4. Tuyệt đối KHÔNG tự ý đề xuất chuyển sang Quản lý hay nhân viên trong câu trả lời của bạn. Bạn cũng KHÔNG có công cụ chuyển người.
 5. Nếu câu hỏi vượt thẩm quyền tự động (vd: xin nhận phòng sớm/trả phòng muộn miễn phí, thương lượng giảm giá/phụ thu, hủy đơn hoàn tiền ngoại lệ) hoặc trường dữ liệu chưa được cập nhật trên DB: hãy gọi \`get_accommodation_info\` (nếu đã biết cơ sở), trả lời trung thực theo dữ liệu hiện có trong DB và cung cấp **thông tin liên hệ trực tiếp của cơ sở** (\`phone\`, \`email\`, \`website_url\`, \`address_line\`) để Quý khách liên hệ trực tiếp.
 6. Bảo vệ dữ liệu riêng tư: Không bao giờ tiết lộ booking của người khác.
+7. Chỉ đưa đường dẫn do tool trả về trong navigationLinks. Sao chép nguyên URL, không tự tạo ID, tên đường dẫn hay tên miền. Dùng nhãn đi kèm URL để khách biết đúng nội dung sẽ mở. Nếu chưa có đường dẫn, gọi tool phù hợp hoặc trả lời bằng văn bản; không tạo liên kết giả. Đặt phòng theo báo giá dùng URL ROOM_QUOTE; xem đơn dùng URL BOOKING, không nhầm hai mục này.
 
 NGỮ CẢNH PHIÊN HIỆN TẠI:
 ${actorLine}
@@ -418,11 +486,21 @@ async function executeAiJob(conversationId, runtime, { outboxJobId = null } = {}
       conversationId: cid,
       cardsToEmit: [],
       // An answer can reuse private information from history without calling a tool again.
-      hasPrivateBookingRead: chronological.some((message) => message.visibility === "OWNER_ONLY"),
+      hasPrivateBookingRead: chronological.some((message) => message.visibility === "OWNER_ONLY") ||
+        Boolean(pageContext.pageType === 'BOOKING_DETAIL' && pageContext.bookingId),
       discussedAccommodations: [],
       lastSearchLocation: null,
       hasCitySearch: false,
+      navigationLinks: [],
     };
+    const contextLinks = collectNavigationLinks({ accommodation: pageContext.accommodationId
+      ? { id: pageContext.accommodationId, ...pageContext } : null,
+      booking: pageContext.pageType === 'BOOKING_DETAIL' && pageContext.bookingId
+        ? { ...pageContext, id: pageContext.bookingId } : null });
+    runContext.navigationLinks = mergeNavigationLinks(chronological.flatMap((message) => {
+      const links = parseJsonSafe(message.payloadJson, {})?.navigationLinks;
+      return Array.isArray(links) ? links : [];
+    }), contextLinks);
 
     await runtime?.emitToConversation(cid, "ai:started", { conversationId: cid, runId });
 
@@ -488,6 +566,9 @@ async function executeAiJob(conversationId, runtime, { outboxJobId = null } = {}
             runContext.lastSearchLocation = toolContext.lastSearchLocation;
             runContext.hasCitySearch = toolContext.hasCitySearch;
             runContext.hasPrivateBookingRead ||= toolContext.hasPrivateBookingRead;
+            const navigationLinks = collectNavigationLinks(toolOutput);
+            runContext.navigationLinks = mergeNavigationLinks(runContext.navigationLinks, navigationLinks);
+            toolOutput = { ...toolOutput, navigationLinks };
           } catch (toolErr) {
             toolOutput = { status: "TOOL_ERROR", message: toolErr?.message || "Lỗi truy vấn dữ liệu." };
           }
@@ -631,7 +712,9 @@ async function executeAiJob(conversationId, runtime, { outboxJobId = null } = {}
         };
       }
 
-      const mainMsg = await insertAiMsg("TEXT", visibility, finalAnswerText, null);
+      const mainMsg = await insertAiMsg("TEXT", visibility, finalAnswerText, {
+        kind: "CHAT_TEXT", navigationLinks: runContext.navigationLinks.slice(-100),
+      });
       createdMessages.push(mainMsg);
 
       for (const card of runContext.cardsToEmit) {
@@ -728,4 +811,6 @@ async function executeAiJob(conversationId, runtime, { outboxJobId = null } = {}
 
 module.exports = {
   executeAiJob,
+  collectNavigationLinks,
+  mergeNavigationLinks,
 };

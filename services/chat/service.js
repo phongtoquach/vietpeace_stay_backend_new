@@ -2,6 +2,7 @@ const config = require("../../configs/chat");
 const { getDBPool, sqlObj } = require("../../configs/database");
 const { searchAccommodationsByFilters } = require("../accommodation_daily_search_service");
 const { getCustomerBookingByCodeOrId } = require("../customer_booking_read_service");
+const { activeManagerAssignedSql } = require("../accommodation_manager_guard");
 const {
   chatError,
   actorKeyForUser,
@@ -18,6 +19,7 @@ const {
   previewText,
 } = require("./db");
 const { appendSystemMessage, hardDeleteTemporaryConversation } = require("./lifecycle");
+const { RATING_STATE_JOINS_SQL, getConversationRatingState } = require("./rating_state");
 
 const POLITE_HOME_GREETING =
   "Xin chào! Mình là Trợ lý AI của VietPeace Stay. Bạn đang dự định đi đâu để mình gợi ý phòng và báo giá nhanh nhé? Nếu cần trao đổi trực tiếp, bạn hãy nhấn Kết nối Quản lý ở phía trên.";
@@ -152,14 +154,14 @@ async function getFeaturedDestinations(limit = 6) {
         (
           SELECT COUNT(*)
           FROM dbo.accommodations AS a
-          WHERE a.status = 1 AND a.deleted_at IS NULL
+          WHERE a.status = 1 AND a.deleted_at IS NULL AND ${activeManagerAssignedSql("a")}
             AND (a.location_id = l.id OR a.location_id IN (SELECT c.id FROM dbo.locations c WHERE c.parent_id = l.id))
         ) AS accommodationCount
       FROM dbo.locations AS l
       WHERE l.is_active = 1
         AND EXISTS (
           SELECT 1 FROM dbo.accommodations AS a
-          WHERE a.status = 1 AND a.deleted_at IS NULL
+          WHERE a.status = 1 AND a.deleted_at IS NULL AND ${activeManagerAssignedSql("a")}
             AND (a.location_id = l.id OR a.location_id IN (SELECT c.id FROM dbo.locations c WHERE c.parent_id = l.id))
         )
       ORDER BY l.is_featured DESC, CASE WHEN l.parent_id IS NULL THEN 0 ELSE 1 END, l.sort_order ASC, l.id ASC;
@@ -233,7 +235,7 @@ async function resolveVerifiedPageContext(rawContext = {}, actor = null) {
           WHERE ai.accommodation_id = a.id
           ORDER BY ai.is_cover DESC, ai.sort_order ASC, ai.id ASC
         ) AS img
-        WHERE a.id = @accomId AND a.status = 1 AND a.deleted_at IS NULL;
+        WHERE a.id = @accomId AND a.status = 1 AND a.deleted_at IS NULL AND ${activeManagerAssignedSql("a")};
       `);
     const prop = res.recordset[0];
     if (prop) {
@@ -703,28 +705,7 @@ const CONV_SELECT_SQL = `
     ORDER BY ai.is_cover DESC, ai.sort_order ASC, ai.id ASC
   ) AS img
   LEFT JOIN dbo.users AS u ON u.id = c.assigned_user_id
-  LEFT JOIN dbo.chat_handoff_sessions AS h ON h.id = c.current_handoff_id
-  LEFT JOIN dbo.chat_conversation_ratings AS r ON r.handoff_id = h.id
-  OUTER APPLY (
-    SELECT TOP 1
-      hp.id AS pendingRatingHandoffId,
-      hu.full_name AS pendingRatingManagerName
-    FROM dbo.chat_handoff_sessions AS hp
-    LEFT JOIN dbo.users AS hu ON hu.id = hp.manager_user_id
-    WHERE (
-        hp.conversation_id = c.id
-        OR (
-          c.source_conversation_id IS NOT NULL
-          AND hp.conversation_id = c.source_conversation_id
-          AND hp.ended_at >= DATEADD(hour, -24, SYSUTCDATETIME())
-        )
-      )
-      AND hp.first_human_reply_at IS NOT NULL
-      AND NOT EXISTS (
-        SELECT 1 FROM dbo.chat_conversation_ratings rr WHERE rr.handoff_id = hp.id
-      )
-    ORDER BY hp.id DESC
-  ) AS pr
+  ${RATING_STATE_JOINS_SQL}
 `;
 
 /**
@@ -1957,6 +1938,7 @@ async function requestHumanSupport(actor, conversationId, { reason = null, accom
         handlingMode: "WAITING_HUMAN",
         currentHandoffId: handoffId,
         managerWaitExpiresAt: expiresAt.toISOString(),
+        ...await getConversationRatingState(tx, cid),
       },
     });
 
@@ -2052,6 +2034,7 @@ async function cancelHumanSupport(actor, conversationId) {
         handlingMode: "AI",
         currentHandoffId: null,
         managerWaitExpiresAt: null,
+        ...await getConversationRatingState(tx, cid),
       },
     });
   });
@@ -2069,8 +2052,6 @@ async function returnOwnerConversationToAi(actor, conversationId) {
     const row = await assertOwnerConversation(actor, cid, tx);
     if (row.status !== "OPEN" || row.handlingMode !== "HUMAN") return;
 
-    let pendingRatingHandoffId = null;
-    let pendingRatingManagerName = row.assignedManagerName || null;
     let targetManagerUserId = row.assignedUserId ? String(row.assignedUserId) : null;
 
     if (row.currentHandoffId) {
@@ -2078,15 +2059,9 @@ async function returnOwnerConversationToAi(actor, conversationId) {
         .input("hid", sqlObj.BigInt, row.currentHandoffId)
         .query(`
           SELECT TOP 1
-            h.id,
             h.target_manager_user_id AS targetManagerUserId,
-            h.manager_user_id AS managerUserId,
-            u.full_name AS managerName,
-            h.first_human_reply_at AS firstHumanReplyAt,
-            CASE WHEN r.id IS NOT NULL THEN 1 ELSE 0 END AS alreadyRated
+            h.manager_user_id AS managerUserId
           FROM dbo.chat_handoff_sessions AS h
-          LEFT JOIN dbo.users AS u ON u.id = COALESCE(h.manager_user_id, h.target_manager_user_id)
-          LEFT JOIN dbo.chat_conversation_ratings AS r ON r.handoff_id = h.id
           WHERE h.id = @hid;
 
           UPDATE dbo.chat_handoff_sessions
@@ -2094,12 +2069,8 @@ async function returnOwnerConversationToAi(actor, conversationId) {
           WHERE id = @hid AND status = 'CLAIMED';
         `);
       const hr = hCheck.recordset?.[0];
-      if (hr?.managerName) pendingRatingManagerName = hr.managerName;
       if (!targetManagerUserId && (hr?.managerUserId || hr?.targetManagerUserId)) {
         targetManagerUserId = String(hr.managerUserId || hr.targetManagerUserId);
-      }
-      if (hr?.firstHumanReplyAt && !hr.alreadyRated) {
-        pendingRatingHandoffId = Number(hr.id);
       }
     }
 
@@ -2154,12 +2125,7 @@ async function returnOwnerConversationToAi(actor, conversationId) {
         assignedManagerName: null,
         currentHandoffId: null,
         managerWaitExpiresAt: null,
-        ...(pendingRatingHandoffId
-          ? {
-              pendingRatingHandoffId,
-              pendingRatingManagerName,
-            }
-          : {}),
+        ...await getConversationRatingState(tx, cid),
       },
     });
   });
@@ -2350,6 +2316,7 @@ async function mergeGuestMessagesIntoCustomerTx(
         content,
         payload_json AS payloadJson,
         client_message_id AS clientMessageId,
+        handoff_id AS handoffId,
         created_at AS createdAt
       FROM dbo.chat_messages
       WHERE conversation_id = @gCid
@@ -2404,20 +2371,37 @@ async function mergeGuestMessagesIntoCustomerTx(
       .input("vis", sqlObj.VarChar(16), m.visibility)
       .input("content", sqlObj.NVarChar(sqlObj.MAX), m.content)
       .input("payloadJson", sqlObj.NVarChar(sqlObj.MAX), m.payloadJson || null)
+      .input("hid", sqlObj.BigInt, m.handoffId ? Number(m.handoffId) : null)
       .input("createdAt", sqlObj.DateTime2(3), m.createdAt)
       .query(`
         INSERT INTO dbo.chat_messages (
           conversation_id, sequence, sender_actor_key, sender_type,
           sender_user_id, sender_guest_session_id, client_message_id,
-          message_type, visibility, content, payload_json, created_at
+          message_type, visibility, content, payload_json, handoff_id, created_at
         )
         VALUES (
           @tCid, @seq, @sKey, @sType,
           @uid, NULL, @cMsgId,
-          @mType, @vis, @content, @payloadJson, @createdAt
+          @mType, @vis, @content, @payloadJson, @hid, @createdAt
         );
       `);
   }
+
+  // Preserve support sessions before the temporary guest shell is deleted.
+  // Otherwise logging in after returning to AI deletes the right to rate them.
+  await newRequest(tx)
+    .input("gCid", sqlObj.BigInt, gCid)
+    .input("tCid", sqlObj.BigInt, targetCid)
+    .input("offset", sqlObj.BigInt, Number(targetCur.lastSequence || 0))
+    .query(`
+      UPDATE dbo.chat_handoff_sessions
+      SET conversation_id = @tCid,
+          visible_from_sequence = visible_from_sequence + @offset,
+          status = CASE WHEN status = 'PENDING' THEN 'CANCELLED' WHEN status = 'CLAIMED' THEN 'RESOLVED' ELSE status END,
+          ended_at = COALESCE(ended_at, SYSUTCDATETIME()),
+          ended_reason = COALESCE(ended_reason, 'CLAIMED_MERGED')
+      WHERE conversation_id = @gCid;
+    `);
 
   let nextScopeType = targetCur.scopeType;
   let nextAccomId = targetCur.accommodationId ? Number(targetCur.accommodationId) : null;
@@ -2480,14 +2464,22 @@ async function claimGuestConversationsToCustomer(customerActor, guestSessionId) 
       .query(`
         SELECT
           id,
+          status,
           scope_type AS scopeType,
           accommodation_id AS accommodationId,
           booking_id AS bookingId,
           handling_mode AS handlingMode,
           context_json AS contextJson
-        FROM dbo.chat_conversations WITH (UPDLOCK, HOLDLOCK)
-        WHERE guest_session_id = @gid AND status = 'OPEN'
+        FROM dbo.chat_conversations AS gc WITH (UPDLOCK, HOLDLOCK)
+        WHERE guest_session_id = @gid AND (
+          status = 'OPEN' OR EXISTS (
+            SELECT 1 FROM dbo.chat_handoff_sessions AS gh
+            WHERE gh.conversation_id = gc.id AND gh.first_human_reply_at IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM dbo.chat_conversation_ratings AS gr WHERE gr.handoff_id = gh.id)
+          )
+        )
         ORDER BY
+          CASE WHEN status = 'OPEN' THEN 0 ELSE 1 END,
           CASE
             WHEN handling_mode = 'HUMAN' THEN 0
             WHEN handling_mode = 'WAITING_HUMAN' THEN 1
@@ -2544,7 +2536,7 @@ async function claimGuestConversationsToCustomer(customerActor, guestSessionId) 
       const gCid = Number(gConv.id);
 
       // If Customer only has an idle AI shell and Guest was already WAITING_HUMAN / HUMAN, carry history and keep Guest's live handoff
-      if (targetCid && targetMode === "AI" && gConv.handlingMode !== "AI") {
+      if (targetCid && targetMode === "AI" && gConv.status === "OPEN" && gConv.handlingMode !== "AI") {
         await syncMessagesFromSourceConversationsTx(tx, {
           targetCid: gCid,
           sourceCids: [targetCid],
@@ -2664,7 +2656,7 @@ async function listHandoffGuideAccommodations(locationId) {
       LEFT JOIN dbo.chat_manager_assignment_epochs AS e
         ON e.accommodation_id = a.id AND e.revoked_at_utc IS NULL
       LEFT JOIN dbo.users AS u ON u.id = e.user_id
-      WHERE a.status = 1 AND a.deleted_at IS NULL
+      WHERE a.status = 1 AND a.deleted_at IS NULL AND ${activeManagerAssignedSql("a")}
       ORDER BY hasActiveManager DESC, a.is_featured DESC, a.sort_order ASC, a.id ASC;
     `);
 

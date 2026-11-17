@@ -2,6 +2,7 @@ const { Type } = require("@google/genai");
 const { getDBPool, sqlObj } = require("../../configs/database");
 const { searchAccommodationsByFilters } = require("../accommodation_daily_search_service");
 const { recommendRoomsAndQuote } = require("../room_recommendation_service");
+const { activeManagerAssignedSql } = require("../accommodation_manager_guard");
 const {
   listCustomerBookings,
   getCustomerBookingByCodeOrId,
@@ -188,7 +189,7 @@ async function fetchAccommodationBrief(accomId) {
       LEFT JOIN dbo.chat_manager_assignment_epochs AS e
         ON e.accommodation_id = a.id AND e.revoked_at_utc IS NULL
       LEFT JOIN dbo.users AS u ON u.id = e.user_id
-      WHERE a.id = @accomId AND a.status = 1 AND a.deleted_at IS NULL;
+      WHERE a.id = @accomId AND a.status = 1 AND a.deleted_at IS NULL AND ${activeManagerAssignedSql("a")};
     `);
   const row = res.recordset[0];
   if (!row) return null;
@@ -233,10 +234,10 @@ async function resolveAccommodationIdByName(name) {
     .input("q", sqlObj.NVarChar(255), `%${name.trim()}%`)
     .query(`
       SELECT TOP 1 id, accommodation_name AS name
-      FROM dbo.accommodations
-      WHERE status = 1 AND deleted_at IS NULL
-        AND accommodation_name LIKE @q
-      ORDER BY is_featured DESC, id ASC;
+      FROM dbo.accommodations AS a
+      WHERE a.status = 1 AND a.deleted_at IS NULL AND ${activeManagerAssignedSql("a")}
+        AND a.accommodation_name LIKE @q
+      ORDER BY a.is_featured DESC, a.id ASC;
     `);
   return res.recordset[0]?.id || null;
 }
@@ -271,8 +272,8 @@ async function executeSearchAccommodations(args, runContext) {
       .request()
       .input("kw", sqlObj.NVarChar(255), `%${String(args.keyword).trim()}%`)
       .query(`
-        SELECT id FROM dbo.accommodations
-        WHERE status = 1 AND deleted_at IS NULL AND accommodation_name LIKE @kw;
+        SELECT a.id FROM dbo.accommodations AS a
+        WHERE a.status = 1 AND a.deleted_at IS NULL AND ${activeManagerAssignedSql("a")} AND a.accommodation_name LIKE @kw;
       `);
     matchedAccomIds = new Set(kwRes.recordset.map((r) => Number(r.id)));
     if (matchedAccomIds.size === 0) {
@@ -437,7 +438,7 @@ async function executeGetAccommodationInfo(args) {
       FROM dbo.accommodations AS a
       LEFT JOIN dbo.accommodation_types AS atp ON atp.id = a.accommodation_type_id
       LEFT JOIN dbo.locations AS l ON l.id = a.location_id
-      WHERE a.id = @accomId AND a.status = 1 AND a.deleted_at IS NULL;
+      WHERE a.id = @accomId AND a.status = 1 AND a.deleted_at IS NULL AND ${activeManagerAssignedSql("a")};
 
       SELECT am.name, am.category_code AS categoryCode, aa.is_chargeable AS isChargeable, aa.note
       FROM dbo.accommodation_amenities AS aa
@@ -508,7 +509,7 @@ async function executeGetAccommodationRoomTypes(args) {
       FROM dbo.room_types AS rt
       INNER JOIN dbo.accommodations AS a ON a.id = rt.accommodation_id
       WHERE rt.accommodation_id = @accomId
-        AND a.status = 1 AND a.deleted_at IS NULL
+        AND a.status = 1 AND a.deleted_at IS NULL AND ${activeManagerAssignedSql("a")}
         AND rt.status = 1 AND rt.deleted_at IS NULL
       ORDER BY rt.sort_order ASC, rt.base_price ASC, rt.id ASC;
 

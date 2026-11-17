@@ -35,11 +35,17 @@ async function assignManager(req, res) {
             req.currentAdmin
         );
 
+        const activationSuffix = result.activatedOnWeb
+            ? " Cơ sở đã chuyển sang Đang hoạt động và hiển thị trên website."
+            : Number(result.accommodationStatus) !== 1
+                ? " Lưu ý: cơ sở cần có ảnh bìa để chuyển sang Đang hoạt động trên website."
+                : "";
+
         return res.status(201).json({
             success: true,
             message: result.emailSent
-                ? "Đã phân công quản lý. Máy chủ email đã chấp nhận thư bàn giao."
-                : "Đã phân công quản lý nhưng chưa gửi được email. Vui lòng gửi lại thông tin bàn giao.",
+                ? `Đã phân công quản lý. Máy chủ email đã chấp nhận thư bàn giao.${activationSuffix}`
+                : `Đã phân công quản lý nhưng chưa gửi được email. Vui lòng gửi lại thông tin bàn giao.${activationSuffix}`,
             data: result
         });
     } catch (error) {
@@ -60,11 +66,15 @@ async function revokeManager(req, res) {
         const accommodationId = Number(req.params.id);
         const result = await managerService.revokeAccommodationManager(accommodationId, req.body || {}, req.currentAdmin);
 
+        const activationSuffix = result.activatedOnWeb
+            ? " Cơ sở đã chuyển sang Đang hoạt động và hiển thị trên website."
+            : "";
+
         return res.status(200).json({
             success: true,
             message: result.emailSent
-                ? "Đã thu hồi quyền cũ và bàn giao cho Manager thay thế. Máy chủ email đã chấp nhận thư."
-                : "Đã thay thế Manager nhưng chưa gửi được email. Vui lòng gửi lại thông tin bàn giao.",
+                ? `Đã thu hồi quyền cũ và bàn giao cho Manager thay thế. Máy chủ email đã chấp nhận thư.${activationSuffix}`
+                : `Đã thay thế Manager nhưng chưa gửi được email. Vui lòng gửi lại thông tin bàn giao.${activationSuffix}`,
             data: result,
         });
     } catch (error) {

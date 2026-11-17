@@ -158,6 +158,7 @@ function mapBookingSummary(row) {
         row.settlement_due_amount ?? row.incidental_grand_total,
       ),
       settledAt: toIsoString(row.settled_at),
+      pendingNegotiationsCount: Number(row.pending_negotiations_count || 0),
     },
   };
 }
@@ -294,8 +295,17 @@ async function getBookingList(query = {}, currentUser = {}) {
       inv.invoice_code,
       inv.settlement_status,
       inv.settled_at,
-      COALESCE(inv.incidental_grand_total, charge_agg.incidental_total, 0) AS incidental_grand_total,
-      COALESCE(inv.settlement_due_amount, charge_agg.incidental_total, 0) AS settlement_due_amount
+      CASE
+        WHEN inv.settlement_status IN ('SETTLED', 'PENDING_PAYMENT')
+          THEN COALESCE(inv.incidental_grand_total, charge_agg.incidental_total, 0)
+        ELSE COALESCE(charge_agg.incidental_total, 0)
+      END AS incidental_grand_total,
+      CASE
+        WHEN inv.settlement_status IN ('SETTLED', 'PENDING_PAYMENT')
+          THEN COALESCE(inv.settlement_due_amount, charge_agg.incidental_total, 0)
+        ELSE COALESCE(charge_agg.incidental_total, 0)
+      END AS settlement_due_amount,
+      COALESCE(neg_agg.pending_count, 0) AS pending_negotiations_count
     FROM dbo.bookings b
     JOIN dbo.accommodations a ON a.id = b.accommodation_id
     LEFT JOIN dbo.booking_checkout_invoices inv ON inv.booking_id = b.id
@@ -304,6 +314,11 @@ async function getBookingList(query = {}, currentUser = {}) {
       FROM dbo.booking_incidental_charges c
       WHERE c.booking_id = b.id AND c.status = 'ACTIVE'
     ) charge_agg
+    OUTER APPLY (
+      SELECT COUNT(1) AS pending_count
+      FROM dbo.compensation_negotiations cn
+      WHERE cn.booking_id = b.id AND cn.status = 'PENDING'
+    ) neg_agg
     OUTER APPLY (
       SELECT TOP 1 am.user_id
       FROM dbo.accommodation_managers am
@@ -415,6 +430,7 @@ function mapBookingDetail(row, items) {
         row.settlement_due_amount ?? row.incidental_grand_total,
       ),
       settledAt: toIsoString(row.settled_at),
+      pendingNegotiationsCount: Number(row.pending_negotiations_count || 0),
     },
     items: items.map(mapBookingItem),
   };
@@ -483,8 +499,17 @@ async function getBookingDetail(bookingId, currentUser = {}) {
       inv.invoice_code,
       inv.settlement_status,
       inv.settled_at,
-      COALESCE(inv.incidental_grand_total, charge_agg.incidental_total, 0) AS incidental_grand_total,
-      COALESCE(inv.settlement_due_amount, charge_agg.incidental_total, 0) AS settlement_due_amount
+      CASE
+        WHEN inv.settlement_status IN ('SETTLED', 'PENDING_PAYMENT')
+          THEN COALESCE(inv.incidental_grand_total, charge_agg.incidental_total, 0)
+        ELSE COALESCE(charge_agg.incidental_total, 0)
+      END AS incidental_grand_total,
+      CASE
+        WHEN inv.settlement_status IN ('SETTLED', 'PENDING_PAYMENT')
+          THEN COALESCE(inv.settlement_due_amount, charge_agg.incidental_total, 0)
+        ELSE COALESCE(charge_agg.incidental_total, 0)
+      END AS settlement_due_amount,
+      COALESCE(neg_agg.pending_count, 0) AS pending_negotiations_count
     FROM dbo.bookings b
     JOIN dbo.accommodations a ON a.id = b.accommodation_id
     LEFT JOIN dbo.booking_checkout_invoices inv ON inv.booking_id = b.id
@@ -493,6 +518,11 @@ async function getBookingDetail(bookingId, currentUser = {}) {
       FROM dbo.booking_incidental_charges c
       WHERE c.booking_id = b.id AND c.status = 'ACTIVE'
     ) charge_agg
+    OUTER APPLY (
+      SELECT COUNT(1) AS pending_count
+      FROM dbo.compensation_negotiations cn
+      WHERE cn.booking_id = b.id AND cn.status = 'PENDING'
+    ) neg_agg
     OUTER APPLY (
       SELECT TOP 1 am.user_id
       FROM dbo.accommodation_managers am

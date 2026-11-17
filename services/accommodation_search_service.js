@@ -1,4 +1,5 @@
 const { sqlObj, getDBPool } = require("../configs/database");
+const { activeManagerAssignedSql } = require("./accommodation_manager_guard");
 
 // ============================================================
 // Sort options
@@ -432,6 +433,7 @@ async function searchAccommodationsByFilters(filters = {}, sort = "default", pag
 	const conditions = [
 		"a.status = 1",
 		"a.deleted_at IS NULL",
+		activeManagerAssignedSql("a"),
 	];
 
 	if (filters.locationId !== null) {

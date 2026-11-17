@@ -573,8 +573,8 @@ function validateAccommodationPayload(body = {}, { isCreate = false } = {}) {
       }),
     );
   } else if (isCreate) {
-    // Không gửi status khi tạo → mặc định bản nháp (mục 5.2).
-    values.status = ACCOMMODATION_STATUS.DRAFT;
+    // Cơ sở mới chưa có Manager nên mặc định Ngừng hoạt động (status = 2).
+    values.status = ACCOMMODATION_STATUS.INACTIVE;
   }
 
   if (has("sortOrder")) {
@@ -1033,6 +1033,7 @@ async function hasActiveManager(executor, accommodationId) {
       FROM dbo.accommodation_managers m
       JOIN dbo.users u ON u.id = m.user_id
       WHERE m.accommodation_id = @accommodationId
+        AND u.role = 'ACCOMMODATION_MANAGER'
         AND u.status = 1;
     `);
 
@@ -1126,7 +1127,7 @@ async function createAccommodation(body = {}, currentUser = {}) {
       childrenPolicy: values.childrenPolicy ?? null,
       petPolicy: values.petPolicy ?? null,
       smokingPolicy: values.smokingPolicy ?? null,
-      status: values.status ?? ACCOMMODATION_STATUS.DRAFT,
+      status: values.status ?? ACCOMMODATION_STATUS.INACTIVE,
       isFeatured: values.isFeatured ?? false,
       sortOrder: values.sortOrder ?? 0,
     };
@@ -1136,7 +1137,7 @@ async function createAccommodation(body = {}, currentUser = {}) {
     if (payload.status === ACCOMMODATION_STATUS.ACTIVE) {
       console.log("[6.5] chặn tạo thẳng ACTIVE vì chưa thể có Manager");
       throw new AccommodationServiceError(
-        "Cơ sở lưu trú mới chưa có người quản lý. Hãy tạo dưới dạng Bản nháp, gán Manager rồi mới kích hoạt.",
+        "Cơ sở lưu trú mới chưa được phân công Manager nên phải ở trạng thái Ngừng hoạt động và tạm ẩn khỏi website cho đến khi phân công Manager.",
         409,
         ERROR_CODES.MANAGER_NOT_ASSIGNED,
         {
@@ -1359,12 +1360,8 @@ async function updateAccommodation(id, body = {}, currentUser = {}) {
     if (has("images")) await replaceImages(transaction, accommodationId, values.images);
     if (has("amenities")) await replaceAmenities(transaction, accommodationId, values.amenities);
     if (has("attractions")) await replaceAttractions(transaction, accommodationId, values.attractions);
-    // R7: chỉ khi CHUYỂN lên ACTIVE (từ 0/2) mới yêu cầu Manager đang hoạt động.
-    // Sửa thông tin khi đang giữ nguyên ACTIVE không phải chuyển trạng thái.
-    if (
-      payload.status === ACCOMMODATION_STATUS.ACTIVE &&
-      Number(current.status) !== ACCOMMODATION_STATUS.ACTIVE
-    ) {
+    // R7: mọi trạng thái ACTIVE (kể cả khi sửa) đều bắt buộc có Manager đang hoạt động.
+    if (payload.status === ACCOMMODATION_STATUS.ACTIVE) {
       await assertManagerAssigned(transaction, accommodationId);
     }
     if (payload.status === ACCOMMODATION_STATUS.ACTIVE) await assertPublishable(transaction, accommodationId);
@@ -1443,8 +1440,7 @@ async function updateAccommodationStatus(id, status, currentUser = {}) {
       request.input(input.name, input.type, input.value);
     }
 
-    // Đọc trạng thái hiện tại trước khi UPDATE để biết đây có phải là
-    // "chuyển sang ACTIVE" hay giữ nguyên trạng thái đang có.
+    // Đọc trạng thái hiện tại trước khi UPDATE.
     const currentResult = await request.query(`
         SELECT a.status
         FROM dbo.accommodations a
@@ -1460,14 +1456,9 @@ async function updateAccommodationStatus(id, status, currentUser = {}) {
       );
     }
 
-    const currentStatus = Number(currentResult.recordset[0].status);
-
-    // R7: chuyển sang ACTIVE yêu cầu đã gán Manager đang hoạt động.
+    // R7: mọi trường hợp đặt ACTIVE đều bắt buộc đã gán Manager đang hoạt động.
     // Thiếu Manager → 409, rollback và không đụng tới dữ liệu.
-    if (
-      nextStatus === ACCOMMODATION_STATUS.ACTIVE &&
-      currentStatus !== ACCOMMODATION_STATUS.ACTIVE
-    ) {
+    if (nextStatus === ACCOMMODATION_STATUS.ACTIVE) {
       await assertManagerAssigned(transaction, accommodationId);
     }
 

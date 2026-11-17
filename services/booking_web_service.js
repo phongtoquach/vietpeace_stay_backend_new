@@ -1,5 +1,6 @@
 const { calculateQuote, toCents, fromCents } = require("./booking_quote_service");
 const { sqlObj, getDBPool } = require("../configs/database");
+const { activeManagerAssignedSql } = require("./accommodation_manager_guard");
 
 const { randomInt, randomUUID } = require("node:crypto");
 const { createBookingCheckout } = require("./booking_checkout_service");
@@ -132,7 +133,8 @@ async function loadRoomData(pool, accommodationId, stay) {
             FROM dbo.accommodations AS a
             WHERE a.id = @accommodationId
               AND a.status = 1
-              AND a.deleted_at IS NULL;
+              AND a.deleted_at IS NULL
+              AND ${activeManagerAssignedSql("a")};
 
             SELECT rt.id
             INTO #ActiveRoomTypes

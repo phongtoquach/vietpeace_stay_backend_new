@@ -968,9 +968,10 @@ async function addIncidentalCharge(bookingId, payload = {}, currentUser = {}) {
         : (catalogItem?.unit_label || "Lần"),
     ).trim().slice(0, 30);
 
-    const note = payload.note !== undefined && payload.note !== null
+    const rawNote = payload.note !== undefined && payload.note !== null
       ? String(payload.note).trim()
-      : null;
+      : "";
+    const note = rawNote ? rawNote.slice(0, 500) : null;
 
     if (
       (derivedCategory === "SPECIAL_CLEANING" ||
@@ -1026,40 +1027,114 @@ async function addIncidentalCharge(bookingId, payload = {}, currentUser = {}) {
 
     await cancelPendingOnlineSettlementsInTx(tx, id);
 
-    await new sql.Request(tx)
-      .input("bookingId", sql.BigInt, id)
-      .input("accommodationId", sql.Int, Number(bookingRow.accommodation_id))
-      .input("catalogItemId", sql.Int, catalogItem ? Number(catalogItem.id) : null)
-      .input("category", sql.VarChar(30), calc.category)
-      .input("itemName", sql.NVarChar(200), itemName)
-      .input("unitLabel", sql.NVarChar(30), unitLabel)
-      .input("quantity", sql.Int, calc.quantity)
-      .input("unitPrice", sql.Decimal(18, 0), calc.unitPrice)
-      .input("compensationMode", sql.VarChar(30), calc.compensationMode)
-      .input("depreciationPercent", sql.Decimal(5, 2), calc.depreciationPercent)
-      .input("adjustmentAmount", sql.Decimal(18, 0), calc.adjustmentAmount)
-      .input("isTaxInclusive", sql.Bit, calc.isTaxInclusive ? 1 : 0)
-      .input("subtotalAmount", sql.Decimal(18, 0), calc.subtotalAmount)
-      .input("taxRate", sql.Decimal(5, 2), calc.taxRate)
-      .input("taxAmount", sql.Decimal(18, 0), calc.taxAmount)
-      .input("totalAmount", sql.Decimal(18, 0), calc.totalAmount)
-      .input("note", sql.NVarChar(500), note)
-      .input("evidenceImageUrl", sql.NVarChar(500), evidenceImageUrl)
-      .input("createdBy", sql.UniqueIdentifier, currentUser.id)
-      .query(`
-        INSERT INTO dbo.booking_incidental_charges (
-          booking_id, accommodation_id, catalog_item_id, category, item_name, unit_label,
-          quantity, unit_price, compensation_mode, depreciation_percent, adjustment_amount,
-          is_tax_inclusive, subtotal_amount, tax_rate, tax_amount, total_amount,
-          note, evidence_image_url, status, created_by, created_at
-        )
-        VALUES (
-          @bookingId, @accommodationId, @catalogItemId, @category, @itemName, @unitLabel,
-          @quantity, @unitPrice, @compensationMode, @depreciationPercent, @adjustmentAmount,
-          @isTaxInclusive, @subtotalAmount, @taxRate, @taxAmount, @totalAmount,
-          @note, @evidenceImageUrl, 'ACTIVE', @createdBy, SYSDATETIME()
-        );
-      `);
+    // Cộng dồn số lượng cho nhóm Minibar / Dịch vụ bổ sung cùng hạng mục, đơn giá, thuế và ghi chú (tránh tách nhiều dòng giống hệt nhau)
+    const canAutoMerge =
+      (calc.category === "MINIBAR_FB" || calc.category === "EXTRA_SERVICE") &&
+      calc.adjustmentAmount === 0 &&
+      !evidenceImageUrl;
+
+    let mergedExisting = null;
+    if (canAutoMerge) {
+      const mergeLookupRes = await new sql.Request(tx)
+        .input("bookingId", sql.BigInt, id)
+        .input("catalogItemId", sql.Int, catalogItem ? Number(catalogItem.id) : null)
+        .input("category", sql.VarChar(30), calc.category)
+        .input("itemName", sql.NVarChar(200), itemName)
+        .input("unitLabel", sql.NVarChar(30), unitLabel)
+        .input("unitPrice", sql.Decimal(18, 0), calc.unitPrice)
+        .input("taxRate", sql.Decimal(5, 2), calc.taxRate)
+        .input("isTaxInclusive", sql.Bit, calc.isTaxInclusive ? 1 : 0)
+        .input("note", sql.NVarChar(500), note)
+        .query(`
+          SELECT TOP 1 *
+          FROM dbo.booking_incidental_charges WITH (UPDLOCK, HOLDLOCK)
+          WHERE booking_id = @bookingId
+            AND status = 'ACTIVE'
+            AND category = @category
+            AND (
+              (@catalogItemId IS NOT NULL AND catalog_item_id = @catalogItemId)
+              OR (@catalogItemId IS NULL AND catalog_item_id IS NULL)
+            )
+            AND LOWER(LTRIM(RTRIM(item_name))) = LOWER(@itemName)
+            AND LOWER(LTRIM(RTRIM(unit_label))) = LOWER(@unitLabel)
+            AND unit_price = @unitPrice
+            AND tax_rate = @taxRate
+            AND is_tax_inclusive = @isTaxInclusive
+            AND adjustment_amount = 0
+            AND evidence_image_url IS NULL
+            AND (
+              (@note IS NULL AND NULLIF(LTRIM(RTRIM(note)), N'') IS NULL)
+              OR (@note IS NOT NULL AND LOWER(LTRIM(RTRIM(note))) = LOWER(@note))
+            )
+          ORDER BY id ASC;
+        `);
+      mergedExisting = mergeLookupRes.recordset[0] || null;
+    }
+
+    if (mergedExisting) {
+      const mergedCalc = calculateChargeAmounts({
+        category: mergedExisting.category,
+        quantity: Number(mergedExisting.quantity) + calc.quantity,
+        unitPrice: Number(mergedExisting.unit_price),
+        compensationMode: mergedExisting.compensation_mode,
+        depreciationPercent: Number(mergedExisting.depreciation_percent ?? 100),
+        adjustmentAmount: Number(mergedExisting.adjustment_amount || 0),
+        taxRate: Number(mergedExisting.tax_rate || 0),
+        isTaxInclusive: Boolean(mergedExisting.is_tax_inclusive),
+      });
+
+      await new sql.Request(tx)
+        .input("chargeId", sql.BigInt, Number(mergedExisting.id))
+        .input("quantity", sql.Int, mergedCalc.quantity)
+        .input("subtotalAmount", sql.Decimal(18, 0), mergedCalc.subtotalAmount)
+        .input("taxAmount", sql.Decimal(18, 0), mergedCalc.taxAmount)
+        .input("totalAmount", sql.Decimal(18, 0), mergedCalc.totalAmount)
+        .query(`
+          UPDATE dbo.booking_incidental_charges
+          SET
+            quantity = @quantity,
+            subtotal_amount = @subtotalAmount,
+            tax_amount = @taxAmount,
+            total_amount = @totalAmount,
+            updated_at = SYSDATETIME()
+          WHERE id = @chargeId;
+        `);
+    } else {
+      await new sql.Request(tx)
+        .input("bookingId", sql.BigInt, id)
+        .input("accommodationId", sql.Int, Number(bookingRow.accommodation_id))
+        .input("catalogItemId", sql.Int, catalogItem ? Number(catalogItem.id) : null)
+        .input("category", sql.VarChar(30), calc.category)
+        .input("itemName", sql.NVarChar(200), itemName)
+        .input("unitLabel", sql.NVarChar(30), unitLabel)
+        .input("quantity", sql.Int, calc.quantity)
+        .input("unitPrice", sql.Decimal(18, 0), calc.unitPrice)
+        .input("compensationMode", sql.VarChar(30), calc.compensationMode)
+        .input("depreciationPercent", sql.Decimal(5, 2), calc.depreciationPercent)
+        .input("adjustmentAmount", sql.Decimal(18, 0), calc.adjustmentAmount)
+        .input("isTaxInclusive", sql.Bit, calc.isTaxInclusive ? 1 : 0)
+        .input("subtotalAmount", sql.Decimal(18, 0), calc.subtotalAmount)
+        .input("taxRate", sql.Decimal(5, 2), calc.taxRate)
+        .input("taxAmount", sql.Decimal(18, 0), calc.taxAmount)
+        .input("totalAmount", sql.Decimal(18, 0), calc.totalAmount)
+        .input("note", sql.NVarChar(500), note)
+        .input("evidenceImageUrl", sql.NVarChar(500), evidenceImageUrl)
+        .input("createdBy", sql.UniqueIdentifier, currentUser.id)
+        .query(`
+          INSERT INTO dbo.booking_incidental_charges (
+            booking_id, accommodation_id, catalog_item_id, category, item_name, unit_label,
+            quantity, unit_price, compensation_mode, depreciation_percent, adjustment_amount,
+            is_tax_inclusive, subtotal_amount, tax_rate, tax_amount, total_amount,
+            note, evidence_image_url, status, created_by, created_at
+          )
+          VALUES (
+            @bookingId, @accommodationId, @catalogItemId, @category, @itemName, @unitLabel,
+            @quantity, @unitPrice, @compensationMode, @depreciationPercent, @adjustmentAmount,
+            @isTaxInclusive, @subtotalAmount, @taxRate, @taxAmount, @totalAmount,
+            @note, @evidenceImageUrl, 'ACTIVE', @createdBy, SYSDATETIME()
+          );
+        `);
+    }
   });
 
   return getCheckoutFolio(id, currentUser);

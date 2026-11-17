@@ -1,5 +1,6 @@
 const db = require("../configs/database");
 const { sqlObj } = db;
+const { activeManagerAssignedSql } = require("./accommodation_manager_guard");
 
 const DEFAULT_MAX_STAY_NIGHTS = 45;
 const STAY_DATE_LIMIT = 1096;
@@ -457,6 +458,7 @@ async function searchAccommodationsByFilters(filters = {}, sort = "default", pag
 	const conditions = [
 		"a.status = 1",
 		"a.deleted_at IS NULL",
+		activeManagerAssignedSql("a"),
 	];
 
 	// if (filters.locationId !== null) {

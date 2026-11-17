@@ -36,7 +36,7 @@ function managerProfile(profile) {
     return { fullName, personalEmail, phoneNumber };
 }
 
-async function deliver(user, accommodation, temporaryPassword) {
+async function deliver(user, accommodation, temporaryPassword, extra = {}) {
     let delivery;
     try {
         delivery = await sendAccountProvisionEmail({
@@ -52,6 +52,7 @@ async function deliver(user, accommodation, temporaryPassword) {
         ...user, accommodationId: accommodation.id, accommodationName: accommodation.accommodation_name,
         mustChangePassword: true, canResendCredentials: true,
         emailSent: delivery.success === true && delivery.method === 'smtp', emailDelivery: delivery.method,
+        ...extra,
     };
 }
 
@@ -74,17 +75,23 @@ async function assignAccommodationManager(value, profile = {}, admin, options = 
     await transaction.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
     let user;
     let accommodation;
+    let activatedOnWeb = false;
+    let nextAccommodationStatus = null;
     try {
         const found = await new sql.Request(transaction).input('id', sql.Int, id)
-            .query(`SELECT id, accommodation_code, accommodation_name
+            .query(`SELECT id, accommodation_code, accommodation_name, status
                 FROM dbo.accommodations WITH (UPDLOCK, HOLDLOCK)
                 WHERE id = @id AND deleted_at IS NULL;`);
         accommodation = found.recordset[0];
         if (!accommodation) throw failure(404, 'NOT_FOUND', 'Không tìm thấy cơ sở lưu trú.');
+        nextAccommodationStatus = Number(accommodation.status);
         const assignment = await new sql.Request(transaction).input('accommodationId', sql.Int, id)
-            .query(`SELECT user_id FROM dbo.accommodation_managers WITH (UPDLOCK, HOLDLOCK)
-                WHERE accommodation_id = @accommodationId;`);
+            .query(`SELECT m.user_id, u.status AS user_status
+                FROM dbo.accommodation_managers m WITH (UPDLOCK, HOLDLOCK)
+                LEFT JOIN dbo.users u ON u.id = m.user_id
+                WHERE m.accommodation_id = @accommodationId;`);
         const previousId = assignment.recordset[0]?.user_id;
+        const previousManagerLocked = assignment.recordset[0] ? Number(assignment.recordset[0].user_status) !== 1 : false;
         if (replacing) {
             if (!previousId || String(previousId).toLowerCase() !== String(options.expectedManagerId).toLowerCase()) {
                 throw failure(409, 'MANAGER_CHANGED', 'Người quản lý đã thay đổi. Vui lòng tải lại danh sách.');
@@ -148,6 +155,24 @@ async function assignAccommodationManager(value, profile = {}, admin, options = 
             .input('adminId', sql.UniqueIdentifier, admin.id)
             .query(`INSERT INTO dbo.accommodation_managers (accommodation_id, user_id, assigned_by_user_id)
                 VALUES (@accommodationId, @userId, @adminId);`);
+        // Khi phân công Manager mới cho cơ sở chưa có quản lý (hoặc quản lý cũ bị khóa),
+        // tự động kích hoạt lại cơ sở nếu đã có ảnh bìa để cơ sở hiển thị trên website.
+        if ((!replacing || previousManagerLocked) && Number(accommodation.status) !== 1) {
+            const coverRes = await new sql.Request(transaction)
+                .input('accommodationId', sql.Int, id)
+                .query(`SELECT COUNT(*) AS coverCount
+                    FROM dbo.accommodation_images
+                    WHERE accommodation_id = @accommodationId AND is_cover = 1;`);
+            if (Number(coverRes.recordset[0]?.coverCount || 0) > 0) {
+                await new sql.Request(transaction)
+                    .input('accommodationId', sql.Int, id)
+                    .query(`UPDATE dbo.accommodations
+                        SET status = 1, updated_at = SYSDATETIME()
+                        WHERE id = @accommodationId AND deleted_at IS NULL;`);
+                activatedOnWeb = true;
+                nextAccommodationStatus = 1;
+            }
+        }
         await new sql.Request(transaction).input('userId', sql.UniqueIdentifier, userId)
             .input('encryptedPassword', sql.NVarChar(1000), encryptPassword(temporaryPassword, userId))
             .query(`DELETE FROM dbo.manager_handover_credentials WHERE user_id = @userId;
@@ -170,7 +195,10 @@ async function assignAccommodationManager(value, profile = {}, admin, options = 
         throw error;
     }
     // SMTP is outside the committed transaction. Failure leaves a retryable handover.
-    return deliver(user, accommodation, temporaryPassword);
+    return deliver(user, accommodation, temporaryPassword, {
+        activatedOnWeb,
+        accommodationStatus: nextAccommodationStatus,
+    });
 }
 
 async function revokeAccommodationManager(id, replacement = {}, admin) {

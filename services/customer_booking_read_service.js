@@ -59,8 +59,20 @@ const BOOKING_SUMMARY_SQL = `
     pay.paid_at AS latestPaidAt,
     inv.invoice_code AS invoiceCode,
     inv.settlement_status AS settlementStatus,
-    CAST(COALESCE(inv.incidental_grand_total, chAgg.incidentalTotal, 0) AS FLOAT) AS incidentalGrandTotal,
-    CAST(COALESCE(inv.settlement_due_amount, chAgg.incidentalTotal, 0) AS FLOAT) AS settlementDueAmount,
+    CAST(
+      CASE
+        WHEN inv.settlement_status IN ('SETTLED', 'PENDING_PAYMENT')
+          THEN COALESCE(inv.incidental_grand_total, chAgg.incidentalTotal, 0)
+        ELSE COALESCE(chAgg.incidentalTotal, 0)
+      END AS FLOAT
+    ) AS incidentalGrandTotal,
+    CAST(
+      CASE
+        WHEN inv.settlement_status IN ('SETTLED', 'PENDING_PAYMENT')
+          THEN COALESCE(inv.settlement_due_amount, chAgg.incidentalTotal, 0)
+        ELSE COALESCE(chAgg.incidentalTotal, 0)
+      END AS FLOAT
+    ) AS settlementDueAmount,
     CAST(COALESCE(inv.settlement_paid_amount, 0) AS FLOAT) AS settlementPaidAmount,
     inv.settled_at AS settledAt
   FROM dbo.bookings AS b

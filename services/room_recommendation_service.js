@@ -1,5 +1,6 @@
 const { getDBPool, sqlObj } = require("../configs/database");
 const { calculateQuote, toCents, fromCents } = require("./booking_quote_service");
+const { activeManagerAssignedSql } = require("./accommodation_manager_guard");
 
 function todayInVietnam() {
   const formatter = new Intl.DateTimeFormat("en-CA", {
@@ -201,7 +202,7 @@ async function recommendRoomsAndQuote({
         l.name AS locationName
       FROM dbo.accommodations AS a
       LEFT JOIN dbo.locations AS l ON l.id = a.location_id
-      WHERE a.id = @accomId AND a.status = 1 AND a.deleted_at IS NULL;
+      WHERE a.id = @accomId AND a.status = 1 AND a.deleted_at IS NULL AND ${activeManagerAssignedSql("a")};
 
       SELECT
         rt.id,
@@ -325,7 +326,7 @@ async function recommendRoomsAndQuote({
         totalAdults,
         totalChildren,
         quote,
-        bookingUrl: `/accommodation-detail?accommodationId=${accomId}&checkin=${ci}&checkout=${co}&rooms=${quote.selectedRooms.length}`,
+        bookingUrl: `/accommodation-detail?accommodationId=${accomId}&checkin=${ci}&checkout=${co}&rooms=${quote.selectedRooms.length}&adults=${totalAdults}&children=${totalChildren}&selection=${encodeURIComponent(JSON.stringify(selection.map(({ roomTypeId, adults, children }) => ({ roomTypeId, adults, children }))))}#room-selection`,
       });
     } catch {
       // ignore invalid combinations

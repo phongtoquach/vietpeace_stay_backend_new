@@ -303,6 +303,21 @@ async function updateAdminUser(targetUserId, { fullName, personalEmail, phoneNum
         `);
 
     if (newStatus !== 1) {
+        if (targetUser.role === "ACCOMMODATION_MANAGER") {
+            await pool
+                .request()
+                .input("id", sql.UniqueIdentifier, targetUserId)
+                .query(`
+                    UPDATE a
+                    SET a.status = 2,
+                        a.updated_at = SYSDATETIME()
+                    FROM dbo.accommodations a
+                    INNER JOIN dbo.accommodation_managers m ON m.accommodation_id = a.id
+                    WHERE m.user_id = @id
+                      AND a.deleted_at IS NULL
+                      AND a.status = 1;
+                `);
+        }
         await revokeUserAccess(null, targetUserId, "USER_LOCKED").catch(() => {});
         triggerOutboxDrain();
     }
@@ -352,6 +367,21 @@ async function toggleUserStatus(targetUserId, currentAdmin) {
         `);
 
     if (newStatus !== 1) {
+        if (targetUser.role === "ACCOMMODATION_MANAGER") {
+            await pool
+                .request()
+                .input("id", sql.UniqueIdentifier, targetUserId)
+                .query(`
+                    UPDATE a
+                    SET a.status = 2,
+                        a.updated_at = SYSDATETIME()
+                    FROM dbo.accommodations a
+                    INNER JOIN dbo.accommodation_managers m ON m.accommodation_id = a.id
+                    WHERE m.user_id = @id
+                      AND a.deleted_at IS NULL
+                      AND a.status = 1;
+                `);
+        }
         await revokeUserAccess(null, targetUserId, "USER_LOCKED").catch(() => {});
         triggerOutboxDrain();
     }
@@ -530,6 +560,22 @@ async function deleteAdminUser(targetUserId, currentAdmin) {
             .request()
             .input("userId", sql.UniqueIdentifier, targetUserId)
             .query("UPDATE dbo.users SET status = 2, updated_at = SYSDATETIME() WHERE id = @userId;");
+
+        if (targetUser.role === "ACCOMMODATION_MANAGER") {
+            await pool
+                .request()
+                .input("userId", sql.UniqueIdentifier, targetUserId)
+                .query(`
+                    UPDATE a
+                    SET a.status = 2,
+                        a.updated_at = SYSDATETIME()
+                    FROM dbo.accommodations a
+                    INNER JOIN dbo.accommodation_managers m ON m.accommodation_id = a.id
+                    WHERE m.user_id = @userId
+                      AND a.deleted_at IS NULL
+                      AND a.status = 1;
+                `);
+        }
 
         await revokeUserAccess(null, targetUserId, "USER_DEACTIVATED").catch(() => {});
         triggerOutboxDrain();
