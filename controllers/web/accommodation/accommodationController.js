@@ -36,9 +36,20 @@ async function searchAccommodations(req, res) {
 
         const sort = body.sort;
 
+        // check page size
+        const DEFAULT_PAGE_SIZE = 6;
+        const configuredPageSize = process.env.ACCOMMODATIONS_LIST_PAGESIZE?.trim() ?? "";
+        const envPageSize = Number(configuredPageSize);
+        const defaultPageSize =
+            /^\d+$/.test(configuredPageSize) && envPageSize <= 100
+                ? envPageSize
+                : DEFAULT_PAGE_SIZE;
+        
+        console.log("[searchAccommodations] defaultPageSize sau cung : ", defaultPageSize);
+
         const pagination = {
             page: body.page,
-            pageSize: body.pageSize
+            pageSize: body.pageSize ?? defaultPageSize
         };
 
         const result = await accommodationSearchService.searchAccommodationsByFilters(filters, sort, pagination);
